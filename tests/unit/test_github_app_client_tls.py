@@ -1,10 +1,20 @@
+import io
+import json
 import ssl
+import urllib.error
 import urllib.request
 from typing import Any
 
 import jwt
 import pytest
 
+from gemini_review.domain import (
+    Finding,
+    PullRequest,
+    RepoRef,
+    ReviewEvent,
+    ReviewResult,
+)
 from gemini_review.infrastructure import github_app_client
 from gemini_review.infrastructure.github_app_client import GitHubAppClient
 
@@ -121,3 +131,176 @@ def test_request_object_raises_when_response_is_array(
 
     with pytest.raises(RuntimeError, match="expected JSON object"):
         client._request_object("GET", "https://api.github.com/x", auth="token t")
+
+
+def _sample_pr() -> PullRequest:
+    return PullRequest(
+        repo=RepoRef("o", "r"),
+        number=9,
+        title="t",
+        body="",
+        head_sha="abc",
+        head_ref="feat",
+        base_sha="def",
+        base_ref="main",
+        clone_url="https://example/x.git",
+        changed_files=("a.py",),
+        installation_id=7,
+        is_draft=False,
+    )
+
+
+def test_post_review_drops_inline_comments_and_retries_on_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """모델이 diff 범위 밖 라인을 지적해 422 가 나면 comments 를 비우고 재시도한다.
+
+    Reviews API 는 bulk 등록이라 inline comment 하나가 잘못된 라인을 가리키면 전체
+    등록이 거부된다. 어느 comment 가 문제인지 API 가 구분해서 알려주지 않으므로,
+    본문(요약 / 좋은 점 / 개선할 점) 만이라도 PR 에 남기기 위해 comments 를 비우고
+    1회 재시도하는 정책을 고정한다.
+    """
+    posted_bodies: list[dict[str, Any]] = []
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        # installation token 호출은 정상 응답으로 처리
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+
+        # review POST 호출만 캡처 — 첫 번째는 422, 두 번째는 성공
+        assert req.data is not None
+        body = json.loads(req.data.decode("utf-8"))
+        posted_bodies.append(body)
+        if len(posted_bodies) == 1:
+            raise urllib.error.HTTPError(
+                req.full_url,
+                422,
+                "Unprocessable Entity",
+                {},  # type: ignore[arg-type]
+                io.BytesIO(
+                    b'{"message": "Validation Failed", "errors": ['
+                    b'{"resource": "PullRequestReviewComment", '
+                    b'"code": "custom", '
+                    b'"message": "pull_request_review_thread.line must be part of the diff"}]}'
+                ),
+            )
+        return _FakeResponse(b'{"id": 1}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    result = ReviewResult(
+        summary="요약",
+        event=ReviewEvent.COMMENT,
+        positives=("좋음",),
+        improvements=("개선",),
+        findings=(Finding(path="a.py", line=42, body="diff 범위 밖 라인"),),
+    )
+
+    # 예외가 삼켜져야 함 (본문만이라도 게시)
+    client.post_review(_sample_pr(), result)
+
+    assert len(posted_bodies) == 2, "초기 POST + 재시도 = 2회 호출돼야 함"
+
+    # 1차: comments 포함
+    assert len(posted_bodies[0]["comments"]) == 1
+    assert posted_bodies[0]["comments"][0]["path"] == "a.py"
+    assert posted_bodies[0]["comments"][0]["line"] == 42
+
+    # 2차: comments 비워졌지만 body 와 기타 필드는 동일 (본문 보존)
+    assert posted_bodies[1]["comments"] == []
+    assert posted_bodies[1]["body"] == posted_bodies[0]["body"]
+    assert posted_bodies[1]["commit_id"] == posted_bodies[0]["commit_id"]
+    assert posted_bodies[1]["event"] == posted_bodies[0]["event"]
+
+
+def test_post_review_does_not_retry_when_no_comments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """comments 가 처음부터 비어 있었다면 422 는 다른 원인이므로 재시도하지 않는다.
+
+    재시도가 같은 payload 로 반복되는 무한 루프를 막고, 진짜 원인(예: 잘못된 commit_id,
+    invalid event) 이 로그와 예외로 드러나도록 유지한다.
+    """
+    call_count = 0
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        nonlocal call_count
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        call_count += 1
+        raise urllib.error.HTTPError(
+            req.full_url,
+            422,
+            "Unprocessable Entity",
+            {},  # type: ignore[arg-type]
+            io.BytesIO(b'{"message": "Validation Failed"}'),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    result = ReviewResult(
+        summary="요약",
+        event=ReviewEvent.COMMENT,
+        # findings 없음
+    )
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        client.post_review(_sample_pr(), result)
+
+    assert exc.value.code == 422
+    assert call_count == 1, "재시도 없이 첫 실패에서 종료돼야 함"
+
+
+def test_post_review_does_not_retry_on_non_422(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """422 가 아닌 다른 HTTP 에러(예: 404, 401, 500)는 그대로 전파."""
+    call_count = 0
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        nonlocal call_count
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        call_count += 1
+        raise urllib.error.HTTPError(
+            req.full_url,
+            500,
+            "Internal Server Error",
+            {},  # type: ignore[arg-type]
+            io.BytesIO(b'{"message": "boom"}'),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    result = ReviewResult(
+        summary="요약",
+        event=ReviewEvent.COMMENT,
+        findings=(Finding(path="a.py", line=5, body="x"),),
+    )
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        client.post_review(_sample_pr(), result)
+
+    assert exc.value.code == 500
+    assert call_count == 1

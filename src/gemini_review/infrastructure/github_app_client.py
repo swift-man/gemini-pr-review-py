@@ -129,13 +129,31 @@ class GitHubAppClient:
         url = f"{self._api_base}/repos/{pr.repo.full_name}/pulls/{pr.number}/reviews"
         # commit_id 를 명시해야 리뷰가 "이 head SHA 시점"에 고정된다. 생략하면 최신 SHA 기준으로
         # 붙어 라인 번호 오정렬이 발생할 수 있다.
+        comments = [_finding_to_comment(f) for f in result.findings]
         payload: dict[str, object] = {
             "commit_id": pr.head_sha,
             "body": result.render_body(),
             "event": result.event.value,
-            "comments": [_finding_to_comment(f) for f in result.findings],
+            "comments": comments,
         }
-        self._request_object("POST", url, auth=f"token {token}", body=payload)
+        try:
+            self._request_object("POST", url, auth=f"token {token}", body=payload)
+        except urllib.error.HTTPError as exc:
+            # Reviews API 는 bulk 등록이라 inline comment 하나가 diff 범위 밖 라인을
+            # 가리키면 422 로 전체 등록이 거부된다 (본문·positives·improvements 까지 날아감).
+            # 어느 comment 가 문제였는지 API 가 구분해서 알려주지 않으므로, 본문만이라도
+            # 살리기 위해 comments 를 비우고 1회 재시도한다.
+            if exc.code != 422 or not comments:
+                raise
+            logger.warning(
+                "review POST returned 422 for %s#%d; dropping %d inline comments and "
+                "retrying with body only",
+                pr.repo.full_name,
+                pr.number,
+                len(comments),
+            )
+            payload["comments"] = []
+            self._request_object("POST", url, auth=f"token {token}", body=payload)
 
     def post_comment(self, pr: PullRequest, body: str) -> None:
         if self._dry_run:
