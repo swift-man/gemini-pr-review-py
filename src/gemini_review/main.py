@@ -58,6 +58,7 @@ def build_handler(settings: Settings) -> WebhookHandler:
         secret=settings.github_webhook_secret,
         github=github,
         use_case=use_case,
+        concurrency=settings.review_concurrency,
     )
 
 
