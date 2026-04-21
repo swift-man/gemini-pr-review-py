@@ -12,9 +12,9 @@ class ReviewResult:
     - 개선할 점 (improvements)
     - 기술 단위 코멘트 (findings) — posted as inline, line-anchored comments
 
-    `model` 은 리뷰를 실제로 생성한 Gemini 모델 이름. fallback 체인이 발동해 primary
-    모델이 아닌 대체 모델이 결과를 돌려준 경우 본문 푸터로 운영자에게 그 사실을
-    가시화한다. None 이면 푸터를 생략한다.
+    `model` 은 이 리뷰를 생성한 모델 식별자. 설정돼 있으면 본문 푸터로 렌더되고
+    None 이면 생략된다. 값의 의미와 어떤 상황에서 채워지는지는 채워 주는 엔진
+    구현의 책임 (예: `GeminiCliEngine` 이 fallback 이후 실제 성공한 모델명을 주입).
     """
 
     summary: str
