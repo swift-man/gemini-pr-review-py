@@ -9,7 +9,7 @@ GitHub App 웹훅으로 PR 이벤트를 받아, 레포를 체크아웃하고 전
 - GitHub App 설치 토큰 기반 인증 (PAT 불필요)
 - diff가 아닌 **전체 코드베이스**를 컨텍스트로 사용
 - Gemini CLI를 `subprocess`로 호출 → 로그인된 **Google 계정의 OAuth 토큰** 사용 (기본 모델 `gemini-2.5-pro`)
-- Preview 모델 capacity/availability 실패 시 안정 모델로 자동 fallback
+- Preview 모델 capacity/availability, 네트워크·스트림 절단(`ERR_STREAM_PREMATURE_CLOSE` 등) 실패 시 안정 모델로 자동 fallback
 - 한국어 리뷰 고정 출력 (JSON 스키마 강제)
 - **리뷰 3분류**: `좋은 점` / `개선할 점` / `기술 단위 코멘트(라인 고정)`
 - 라인 고정 코멘트만 인라인으로 게시, 라인 번호 없는 지적은 `개선할 점`으로 이동
@@ -92,7 +92,7 @@ REPO_FULL_NAME=owner/repo PR_NUMBER=1 INSTALLATION_ID=1234567 \
 | `GITHUB_WEBHOOK_SECRET` | — | HMAC 서명 검증용 비밀 (필수) |
 | `GEMINI_BIN` | `gemini` | Gemini CLI 실행 파일 |
 | `GEMINI_MODEL` | `gemini-2.5-pro` | 모델 (`gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`) |
-| `GEMINI_FALLBACK_MODELS` | `gemini-2.5-pro` | `GEMINI_MODEL`이 429/capacity/preview unavailable로 실패할 때 재시도할 comma-separated 모델 목록 |
+| `GEMINI_FALLBACK_MODELS` | `gemini-2.5-pro` | `GEMINI_MODEL`이 429/capacity/preview unavailable, 또는 스트림 절단(`ERR_STREAM_PREMATURE_CLOSE` / `ECONNRESET`/`socket hang up`)로 실패할 때 재시도할 comma-separated 모델 목록 |
 | `GEMINI_MAX_INPUT_TOKENS` | `900000` | 전체 컨텍스트 토큰 예산 (2.5-pro 는 최대 1M 토큰) |
 | `GEMINI_TIMEOUT_SEC` | `600` | 호출 타임아웃 |
 | `GEMINI_OAUTH_CREDS_PATH` | `~/.gemini/oauth_creds.json` | Google OAuth 자격 증명 파일 |

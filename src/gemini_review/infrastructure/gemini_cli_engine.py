@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 _STDIN_PROMPT_PLACEHOLDER = " "
 _DEFAULT_FALLBACK_MODELS = ("gemini-2.5-pro",)
 _RETRYABLE_MODEL_FAILURE_MARKERS = (
+    # 용량 / 레이트 관련 — preview 모델이 포화됐거나 무료 티어 한도에 닿은 경우
     "429",
     "model_capacity_exhausted",
     "no capacity available",
@@ -20,6 +21,13 @@ _RETRYABLE_MODEL_FAILURE_MARKERS = (
     "ratelimitexceeded",
     "resource_exhausted",
     "too many requests",
+    # 스트림 / 네트워크 절단 — preview 모델이 긴 응답 중에 Google 서버에서 끊어버리는 경우가
+    # 실관측됨(`ERR_STREAM_PREMATURE_CLOSE`). 모델 쪽 일시 불안정에 가까우므로 같은 모델 재시도가
+    # 아닌 안정 fallback 모델로 바로 넘기는 게 타당하다.
+    "premature close",
+    "err_stream_premature_close",
+    "econnreset",
+    "socket hang up",
 )
 
 

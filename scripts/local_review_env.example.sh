@@ -14,7 +14,10 @@ export GITHUB_WEBHOOK_SECRET="change-me-long-random"
 # Available models (상위 순):
 #   gemini-2.5-pro, gemini-2.5-flash, gemini-2.5-flash-lite
 export GEMINI_MODEL="gemini-2.5-pro"
-# Primary 모델이 429/capacity/preview unavailable 로 실패하면 왼쪽부터 순서대로 재시도.
+# Primary 모델이 다음 사유로 실패하면 왼쪽부터 순서대로 재시도:
+#   - 용량/레이트: 429, resource_exhausted, rate limit exceeded
+#   - preview 미가용: "preview ... not found/unavailable"
+#   - 스트림/네트워크 절단: ERR_STREAM_PREMATURE_CLOSE, ECONNRESET, socket hang up
 # 비우면 fallback 비활성화:
 #   export GEMINI_FALLBACK_MODELS=""
 export GEMINI_FALLBACK_MODELS="gemini-2.5-pro"
