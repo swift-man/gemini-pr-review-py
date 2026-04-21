@@ -5,6 +5,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import Any
 
 import certifi
@@ -139,15 +140,16 @@ class GitHubAppClient:
         try:
             self._request_object("POST", url, auth=f"token {token}", body=payload)
         except urllib.error.HTTPError as exc:
-            # Reviews API 는 bulk 등록이라 inline comment 하나가 diff 범위 밖 라인을
-            # 가리키면 422 로 전체 등록이 거부된다 (본문·positives·improvements 까지 날아감).
-            # 어느 comment 가 문제였는지 API 가 구분해서 알려주지 않으므로, 본문만이라도
-            # 살리기 위해 comments 를 비우고 1회 재시도한다.
-            if exc.code != 422 or not comments:
+            # Reviews API 는 bulk 등록이라 inline comment 하나가 diff 범위 밖 라인을 가리키면
+            # UNPROCESSABLE_ENTITY 로 전체 등록이 거부된다 (본문·positives·improvements 까지
+            # 날아감). 어느 comment 가 문제였는지 API 가 구분해서 알려주지 않으므로, 본문만
+            # 이라도 살리기 위해 comments 를 비우고 1회 재시도한다.
+            if exc.code != HTTPStatus.UNPROCESSABLE_ENTITY or not comments:
                 raise
             logger.warning(
-                "review POST returned 422 for %s#%d; dropping %d inline comments and "
+                "review POST returned %d for %s#%d; dropping %d inline comments and "
                 "retrying with body only",
+                HTTPStatus.UNPROCESSABLE_ENTITY.value,
                 pr.repo.full_name,
                 pr.number,
                 len(comments),
