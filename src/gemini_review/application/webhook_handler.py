@@ -29,6 +29,11 @@ class WebhookJob:
     number: int
     installation_id: int
 
+    def __str__(self) -> str:
+        # stop() 의 드롭 로그와 운영 관측성에 쓰이는 공용 포맷. delivery_id 와 PR 식별자가
+        # 함께 찍혀야 GitHub Recent Deliveries 와 교차 대조 + 재시도 대상 식별이 가능.
+        return f"{self.delivery_id}({self.repo.full_name}#{self.number})"
+
 
 class WebhookHandler:
     """webhook 을 검증하고 리뷰 작업을 큐에 넣은 뒤 직렬로 소비한다."""
@@ -86,7 +91,7 @@ class WebhookHandler:
             logger.warning(
                 "shutting down with pending work — in_flight=%s, queued=%d; "
                 "waiting up to %.1fs for graceful completion",
-                _format_job(in_flight_snapshot),
+                in_flight_snapshot or "none",
                 queued_before,
                 timeout,
             )
@@ -96,18 +101,39 @@ class WebhookHandler:
 
         if worker.is_alive():
             # 워커가 timeout 안에 안 끝남 — 데몬이라 프로세스 종료 시 강제로 죽는다.
-            # qsize() 는 근사치지만 이 시점엔 worker 가 이미 get() 을 안 하므로 안정값.
+            # worker 는 이 시점 이전에 이미 _stop 신호로 get() 루프를 벗어났어야 하지만,
+            # _process 내부 블로킹(gemini CLI) 으로 묶여 있는 경우도 있다. 어쨌든 큐에는
+            # 더 이상 손대지 않으므로 내부 deque 스냅샷이 안정.
             with self._in_flight_lock:
                 still_in_flight = self._in_flight
-            remaining_queue = self._queue.qsize()
+            remaining_jobs = self._snapshot_queue()
             logger.error(
                 "worker did not finish within %.1fs; review in-flight=%s, "
-                "remaining_queue=%d may be lost. "
+                "remaining_queue=[%s] may be lost. "
                 "operator: re-trigger the affected PR(s) with an empty commit.",
                 timeout,
-                _format_job(still_in_flight),
-                remaining_queue,
+                still_in_flight or "none",
+                ", ".join(str(job) for job in remaining_jobs) or "empty",
             )
+            # _worker 는 일부러 정리하지 않는다. 스레드 객체가 아직 살아 있는 상태에서
+            # 레퍼런스를 지우면 후속 start() 가 좀비 옆에 새 워커를 띄워 중복 실행된다.
+            return
+
+        # 정상 종료 — 인스턴스가 start() 로 재사용될 수 있도록 스레드 레퍼런스 초기화.
+        # (운영상 같은 인스턴스 재사용은 드물지만, lifespan 이 restart 되거나 테스트가
+        #  한 인스턴스를 stop/start 순서로 검증하는 경우 필요.)
+        self._worker = None
+
+    def _snapshot_queue(self) -> list[WebhookJob]:
+        """락을 잡고 내부 deque 를 얕은 복사로 찍는다 — 드롭 대상 식별용.
+
+        `Queue.mutex` 는 문서화된 락이며 여기서 잠깐 잡아 스냅샷만 떠 나와도 워커가
+        어차피 `_stop` 이후 get() 하지 않으므로 경합 위험이 없다. `qsize()` 만으로는
+        "몇 개가 있었는지" 밖에 모르고 "어떤 PR 이었는지" 를 놓치는데, 드롭 대상 재시도
+        안내가 이 PR 의 핵심 목적이라 식별자가 필요.
+        """
+        with self._queue.mutex:
+            return list(self._queue.queue)
 
     # --- 서명 검증 ----------------------------------------------------------
 
@@ -214,9 +240,3 @@ class WebhookHandler:
             # "드롭된 작업" 로그가 거짓 양성(false positive) 으로 안 찍힌다.
             with self._in_flight_lock:
                 self._in_flight = None
-
-
-def _format_job(job: WebhookJob | None) -> str:
-    if job is None:
-        return "none"
-    return f"{job.delivery_id}({job.repo.full_name}#{job.number})"

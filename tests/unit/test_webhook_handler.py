@@ -334,6 +334,10 @@ def test_stop_logs_error_when_worker_is_stuck_past_timeout(
     try:
         handler.accept("pull_request", "dstuck", _queued_payload(number=7))
         assert engine.started.wait(timeout=3.0), "worker never entered review()"
+        # 워커가 stuck 상태인 동안 추가로 큐에 쌓이는 작업들 — 드롭 로그에 식별자가 모두
+        # 나열되는지 검증하기 위한 고정 케이스.
+        handler.accept("pull_request", "dqueued1", _queued_payload(number=11))
+        handler.accept("pull_request", "dqueued2", _queued_payload(number=12))
 
         with caplog.at_level(logging.ERROR):
             handler.stop(timeout=0.3)
@@ -345,13 +349,57 @@ def test_stop_logs_error_when_worker_is_stuck_past_timeout(
         # in-flight 작업의 delivery_id 와 PR 식별자가 로그에 포함되어야 재시도 가능
         assert "dstuck" in joined
         assert "o/r#7" in joined
+        # 큐에 남아 있던 작업들의 식별자도 로그에 포함 — 운영자가 "몇 개" 가 아니라
+        # "어떤 PR" 들을 재시도해야 하는지 알아야 한다.
+        assert "dqueued1" in joined
+        assert "o/r#11" in joined
+        assert "dqueued2" in joined
+        assert "o/r#12" in joined
     finally:
         # 데몬 스레드가 프로세스 종료까지 subprocess 안에 매달려 있지 않도록 풀어준다
         engine.release.set()
 
 
+def test_stop_allows_restart_after_clean_shutdown(tmp_path: Path) -> None:
+    """정상 종료 후 같은 핸들러 인스턴스에서 start() 가 다시 동작해야 한다.
+
+    회귀 방지: stop() 이 `_worker` 레퍼런스를 지우지 않으면 `start()` 의
+    `if self._worker is not None: return` 에 막혀 재기동이 조용히 실패한다.
+    lifespan 이 한 번만 돌더라도, 테스트·개발 시 같은 인스턴스를 재사용할 때
+    좀비 레퍼런스로 인해 워커가 뜨지 않는 혼란을 막는다. 단, timeout 초과 케이스
+    에서는 워커가 여전히 alive 이므로 일부러 정리하지 않는다(스레드 중복 방지).
+    """
+    handler = _build_handler(
+        FakeGitHub(),
+        FileDump(entries=(), total_chars=0),
+        ReviewResult(summary="ok", event=ReviewEvent.COMMENT),
+        tmp_path,
+    )
+
+    handler.start()
+    first_worker = handler._worker  # type: ignore[attr-defined]
+    assert first_worker is not None and first_worker.is_alive()
+
+    handler.stop(timeout=1.0)
+    # 정상 종료 → _worker 가 None 으로 정리됐어야 start() 가 새 스레드를 생성 가능
+    assert handler._worker is None  # type: ignore[attr-defined]
+
+    handler.start()
+    second_worker = handler._worker  # type: ignore[attr-defined]
+    assert second_worker is not None and second_worker.is_alive()
+    assert second_worker is not first_worker
+    handler.stop(timeout=1.0)
+
+
 def test_stop_clears_inflight_after_successful_processing(tmp_path: Path) -> None:
-    """정상 처리 종료 후 _in_flight 가 None 으로 정리돼야 stop() 이 드롭 로그를 오탐 안 찍는다."""
+    """정상 처리 종료 후 _in_flight 가 None 으로 정리돼야 stop() 이 드롭 로그를 오탐 안 찍는다.
+
+    경쟁 조건 주의: `FakeGitHub.post_review` 가 `posted_reviews` 에 append 된 **직후**
+    에도 `_process` 의 `finally:` 블록은 아직 실행되지 않았을 수 있다. 즉
+    `posted_reviews` 만 보고 assert 하면 finally 직전의 찰나를 잡아 간헐적으로 실패
+    한다. 폴링 조건에 `_in_flight is None` 까지 AND 로 묶어 finally 가 돌 때까지
+    기다린다.
+    """
     github = FakeGitHub()
     engine = FakeEngine(ReviewResult(summary="ok", event=ReviewEvent.COMMENT))
     handler = _build_handler_with_engine(tmp_path, engine, github=github)
@@ -359,12 +407,15 @@ def test_stop_clears_inflight_after_successful_processing(tmp_path: Path) -> Non
     handler.start()
     try:
         handler.accept("pull_request", "dok", _queued_payload(number=9))
-        # 리뷰 게시까지 완료될 때까지 폴링 대기 (sleep 단일값에 의존하지 않음)
         deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline and not github.posted_reviews:
+        while time.monotonic() < deadline:
+            if github.posted_reviews and handler._in_flight is None:  # type: ignore[attr-defined]
+                break
             time.sleep(0.02)
-        assert github.posted_reviews, "review 가 제한 시간 내 게시되지 않았다"
+        else:
+            pytest.fail("review + in-flight 정리가 제한 시간 내 완료되지 않았다")
 
+        assert github.posted_reviews
         assert handler._in_flight is None  # type: ignore[attr-defined]
     finally:
         handler.stop(timeout=1.0)
