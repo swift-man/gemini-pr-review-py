@@ -32,7 +32,7 @@ class _CachedToken:
 
 
 class GitHubAppClient:
-    """GitHub REST client authenticating as a GitHub App installation."""
+    """GitHub App installation 으로 인증하는 GitHub REST 클라이언트."""
 
     def __init__(
         self,
@@ -51,7 +51,7 @@ class GitHubAppClient:
         self._tls_context = tls_context or _default_tls_context()
         self._token_cache: dict[int, _CachedToken] = {}
 
-    # --- Auth ---------------------------------------------------------------
+    # --- 인증 ---------------------------------------------------------------
 
     def _app_jwt(self) -> str:
         # iat 를 30초 과거로 당기고 exp 를 10분 한도(GitHub 제한)에 못 미치는 9분으로 잡는 건
@@ -79,7 +79,7 @@ class GitHubAppClient:
         self._token_cache[installation_id] = _CachedToken(token, expires_at)
         return token
 
-    # --- Public API ---------------------------------------------------------
+    # --- 공용 API ------------------------------------------------------------
 
     def fetch_pull_request(
         self, repo: RepoRef, number: int, installation_id: int

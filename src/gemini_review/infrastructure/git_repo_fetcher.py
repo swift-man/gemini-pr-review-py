@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 class GitRepoFetcher:
-    """Clones or updates a cached repo and checks out the PR head SHA."""
+    """캐시된 저장소를 clone/update 하고 PR 의 head SHA 로 체크아웃한다."""
 
     def __init__(self, cache_dir: Path) -> None:
         self._cache_dir = cache_dir

@@ -25,8 +25,11 @@ class _FakeResponse:
 
 @pytest.fixture()
 def captured(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """Intercept urlopen + jwt.encode so we can inspect GitHubAppClient wiring
-    without making real network calls or needing a real RSA key."""
+    """urlopen 과 jwt.encode 를 가로채어 GitHubAppClient 의 호출 배선을 검증한다.
+
+    실제 네트워크 호출이나 실 RSA 키 없이도 "어떤 URL, 어떤 TLS 컨텍스트, 어떤
+    timeout 으로 호출했는가" 를 테스트에서 관찰할 수 있게 해준다.
+    """
     sink: dict[str, Any] = {}
 
     def fake_urlopen(

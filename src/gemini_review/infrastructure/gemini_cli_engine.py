@@ -33,11 +33,11 @@ _RETRYABLE_MODEL_FAILURE_MARKERS = (
 
 
 class GeminiAuthError(RuntimeError):
-    """Raised when the Gemini CLI is not authenticated with Google OAuth."""
+    """Gemini CLI 가 Google OAuth 로 인증되지 않았을 때 발생하는 예외."""
 
 
 class GeminiCliEngine:
-    """Calls the Gemini CLI (`gemini -p`) over stdin and parses a JSON review.
+    """stdin 으로 Gemini CLI (`gemini -p`) 를 호출해 JSON 리뷰를 파싱해 돌려준다.
 
     인증은 Google OAuth 기반 — 운영자가 터미널에서 `gemini` 를 한 번 실행해 브라우저 로그인을
     마치면 `~/.gemini/oauth_creds.json` 에 리프레시 토큰이 저장되고, 이후 호출은 이 파일로 세션을
@@ -60,7 +60,7 @@ class GeminiCliEngine:
         self._oauth_creds_path = oauth_creds_path or Path.home() / ".gemini" / "oauth_creds.json"
 
     def verify_auth(self) -> str:
-        """Two-step preflight: binary is executable AND Google OAuth creds exist.
+        """기동 전 두 단계 사전 점검 — 바이너리가 실행 가능하고 Google OAuth creds 가 존재.
 
         Gemini CLI 는 `auth status` 같은 전용 명령이 없어 파일 존재 + `--version` 응답으로
         확정한다. 파일만 있고 만료됐을 가능성은 실제 호출에서 드러나도록 둔다(리뷰 호출 시

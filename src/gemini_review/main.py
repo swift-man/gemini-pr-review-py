@@ -107,5 +107,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 
 def app_factory() -> FastAPI:
-    """Uvicorn factory entry point: `uvicorn gemini_review.main:app_factory --factory`."""
+    """Uvicorn factory 진입점 — `uvicorn gemini_review.main:app_factory --factory` 로 기동."""
     return create_app()

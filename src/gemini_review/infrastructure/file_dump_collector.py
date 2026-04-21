@@ -173,7 +173,7 @@ _IMPORTANT_CONFIG_NAMES = {
 
 
 class FileDumpCollector:
-    """Collects repository files into a prioritized dump honoring a token budget."""
+    """토큰 예산을 지키면서 우선순위 정렬된 파일 덤프로 저장소를 수집한다."""
 
     def __init__(
         self,

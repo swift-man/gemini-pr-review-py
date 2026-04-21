@@ -28,7 +28,7 @@ def configure_logging(level: str = "INFO") -> None:
 
 
 class DeliveryLogger(logging.LoggerAdapter[logging.Logger]):
-    """Prefixes every log record with `[delivery=<id>]` for webhook tracing."""
+    """모든 로그 레코드 앞에 `[delivery=<id>]` 접두사를 붙여 webhook 흐름을 추적한다."""
 
     def process(self, msg: str, kwargs: dict[str, object]) -> tuple[str, dict[str, object]]:
         delivery = self.extra.get("delivery", "-") if self.extra else "-"

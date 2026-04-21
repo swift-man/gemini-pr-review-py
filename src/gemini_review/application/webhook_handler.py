@@ -25,7 +25,7 @@ class WebhookJob:
 
 
 class WebhookHandler:
-    """Verifies webhooks, enqueues review jobs, and drains them serially."""
+    """webhook 을 검증하고 리뷰 작업을 큐에 넣은 뒤 직렬로 소비한다."""
 
     def __init__(
         self,
@@ -40,7 +40,7 @@ class WebhookHandler:
         self._worker: threading.Thread | None = None
         self._stop = threading.Event()
 
-    # --- Lifecycle ----------------------------------------------------------
+    # --- 라이프사이클 --------------------------------------------------------
 
     def start(self) -> None:
         if self._worker is not None:
@@ -54,7 +54,7 @@ class WebhookHandler:
     def stop(self) -> None:
         self._stop.set()
 
-    # --- Verification -------------------------------------------------------
+    # --- 서명 검증 ----------------------------------------------------------
 
     def verify_signature(self, signature_header: str | None, body: bytes) -> bool:
         # 원문 body 로 HMAC 을 계산해야 함. json.loads 후 재직렬화하면 키 순서/공백 차이로
@@ -65,7 +65,7 @@ class WebhookHandler:
         # hmac.compare_digest 는 타이밍 공격 방지용 상수-시간 비교.
         return hmac.compare_digest(signature_header.removeprefix("sha256="), expected)
 
-    # --- Dispatch -----------------------------------------------------------
+    # --- 디스패치 -----------------------------------------------------------
 
     def accept(
         self,
@@ -124,7 +124,7 @@ class WebhookHandler:
         )
         return 202, "queued"
 
-    # --- Worker -------------------------------------------------------------
+    # --- 워커 ---------------------------------------------------------------
 
     def _run(self) -> None:
         # 완전 직렬화: 한 번에 한 리뷰만 돌린다(동시성 1). Gemini CLI 가 사용자 Google

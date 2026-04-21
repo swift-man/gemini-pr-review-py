@@ -5,12 +5,12 @@ from .finding import Finding, ReviewEvent
 
 @dataclass(frozen=True)
 class ReviewResult:
-    """Structured review output.
+    """구조화된 리뷰 출력물.
 
-    Three sections are rendered in the top-level review body:
+    리뷰 본문 상단에는 세 섹션이 렌더된다:
     - 좋은 점 (positives)
     - 개선할 점 (improvements)
-    - 기술 단위 코멘트 (findings) — posted as inline, line-anchored comments
+    - 기술 단위 코멘트 (findings) — 라인에 고정된 인라인 코멘트로 게시
 
     `model` 은 이 리뷰를 생성한 모델 식별자. 설정돼 있으면 본문 푸터로 렌더되고
     None 이면 생략된다. 값의 의미와 어떤 상황에서 채워지는지는 채워 주는 엔진

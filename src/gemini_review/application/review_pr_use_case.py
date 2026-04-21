@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 
 class ReviewPullRequestUseCase:
-    """Orchestrates: fetch PR → checkout → collect files → review → post."""
+    """리뷰 파이프라인 오케스트레이션: PR 조회 → 체크아웃 → 파일 수집 → 리뷰 → 게시."""
 
     def __init__(
         self,
