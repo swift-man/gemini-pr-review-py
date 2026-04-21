@@ -5,6 +5,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from typing import Any
 
 import certifi
 import jwt
@@ -65,7 +66,7 @@ class GitHubAppClient:
             return cached.token
 
         url = f"{self._api_base}/app/installations/{installation_id}/access_tokens"
-        data = self._request("POST", url, auth=f"Bearer {self._app_jwt()}")
+        data = self._request_object("POST", url, auth=f"Bearer {self._app_jwt()}")
         token = str(data["token"])
         expires = data.get("expires_at", "")
         # GitHub installation token 은 1시간 유효. 만료 직전 요청이 실패하지 않도록 5분 여유.
@@ -85,7 +86,7 @@ class GitHubAppClient:
     ) -> PullRequest:
         token = self.get_installation_token(installation_id)
         pr_url = f"{self._api_base}/repos/{repo.full_name}/pulls/{number}"
-        pr_data = self._request("GET", pr_url, auth=f"token {token}")
+        pr_data = self._request_object("GET", pr_url, auth=f"token {token}")
 
         # 변경 파일 전체를 가져와야 우선순위 정렬(변경 파일 먼저)이 정확해진다.
         # per_page=100 은 GitHub 허용 최대치라 PR 이 큰 경우의 라운드트립 수를 최소화.
@@ -93,8 +94,8 @@ class GitHubAppClient:
         changed: list[str] = []
         page = 1
         while True:
-            files = self._request("GET", f"{files_url}&page={page}", auth=f"token {token}")
-            if not isinstance(files, list) or not files:
+            files = self._request_list("GET", f"{files_url}&page={page}", auth=f"token {token}")
+            if not files:
                 break
             changed.extend(str(f["filename"]) for f in files)
             # 100개 미만이면 마지막 페이지 — Link 헤더 대신 길이로 단순 판정.
@@ -134,7 +135,7 @@ class GitHubAppClient:
             "event": result.event.value,
             "comments": [_finding_to_comment(f) for f in result.findings],
         }
-        self._request("POST", url, auth=f"token {token}", body=payload)
+        self._request_object("POST", url, auth=f"token {token}", body=payload)
 
     def post_comment(self, pr: PullRequest, body: str) -> None:
         if self._dry_run:
@@ -143,18 +144,53 @@ class GitHubAppClient:
 
         token = self.get_installation_token(pr.installation_id)
         url = f"{self._api_base}/repos/{pr.repo.full_name}/issues/{pr.number}/comments"
-        self._request("POST", url, auth=f"token {token}", body={"body": body})
+        self._request_object("POST", url, auth=f"token {token}", body={"body": body})
 
     # --- HTTP ---------------------------------------------------------------
+    #
+    # `_http` 는 인증·직렬화·HTTPError 로깅만 책임지는 저수준 원시 호출. 반환 타입은
+    # `Any` 로 열어 두고, GitHub 엔드포인트가 돌려주는 JSON 형태에 따라 아래 두 공용
+    # 래퍼가 "객체 vs 배열" 을 경계에서 타입 좁힘 + 런타임 검증한다. 덕분에 호출부는
+    # isinstance 분기와 mypy strict 의 `object | list` 유니온 인덱싱 에러에서 자유롭다.
 
-    def _request(
+    def _request_object(
         self,
         method: str,
         url: str,
         *,
         auth: str,
         body: object | None = None,
-    ) -> dict[str, object] | list[object]:
+    ) -> dict[str, Any]:
+        data = self._http(method, url, auth=auth, body=body)
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"expected JSON object from {method} {url}, got {type(data).__name__}"
+            )
+        return data
+
+    def _request_list(
+        self,
+        method: str,
+        url: str,
+        *,
+        auth: str,
+        body: object | None = None,
+    ) -> list[Any]:
+        data = self._http(method, url, auth=auth, body=body)
+        if not isinstance(data, list):
+            raise RuntimeError(
+                f"expected JSON array from {method} {url}, got {type(data).__name__}"
+            )
+        return data
+
+    def _http(
+        self,
+        method: str,
+        url: str,
+        *,
+        auth: str,
+        body: object | None = None,
+    ) -> Any:
         headers = {
             "Authorization": auth,
             "Accept": "application/vnd.github+json",
