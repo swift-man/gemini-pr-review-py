@@ -1,13 +1,19 @@
 import hashlib
 import hmac
+import logging
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from gemini_review.application.review_pr_use_case import ReviewPullRequestUseCase
 from gemini_review.application.webhook_handler import WebhookHandler
 from gemini_review.domain import (
     FileDump,
+    FileEntry,
     PullRequest,
     RepoRef,
     ReviewEvent,
@@ -245,3 +251,120 @@ def test_accept_queues_valid_pr_and_returns_202(tmp_path: Path) -> None:
     code, reason = handler.accept("pull_request", "d4", payload)
     assert code == 202
     assert reason == "queued"
+
+
+# --- stop() graceful shutdown -----------------------------------------------
+
+
+class _BlockingEngine:
+    """review() 호출 시 `started` 를 세운 뒤 `release` 가 세워질 때까지 블로킹.
+
+    graceful shutdown 타임아웃 분기를 결정적으로 재현하려면 worker 가 현재 작업에
+    물려 있는 상태를 테스트에서 정확히 만들어야 한다. sleep 기반 타이밍은 CI 에서
+    쉽게 불안정해지므로 Event 로 동기화.
+    """
+
+    def __init__(self, result: ReviewResult) -> None:
+        self._result = result
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def review(self, pr: PullRequest, dump: FileDump) -> ReviewResult:
+        self.started.set()
+        self.release.wait(timeout=5.0)
+        return self._result
+
+
+def _build_handler_with_engine(
+    tmp_path: Path, engine: _BlockingEngine | FakeEngine, github: FakeGitHub | None = None
+) -> WebhookHandler:
+    gh = github or FakeGitHub()
+    gh.pr_to_return = _sample_pr()
+    dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x", size_bytes=1, is_changed=True),),
+        total_chars=1,
+        exceeded_budget=False,
+    )
+    use_case = ReviewPullRequestUseCase(
+        github=gh,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=engine,  # type: ignore[arg-type]
+        max_input_tokens=1000,
+    )
+    return WebhookHandler(secret=SECRET, github=gh, use_case=use_case)
+
+
+def _queued_payload(number: int) -> dict[str, Any]:
+    return {
+        "action": "opened",
+        "pull_request": {"draft": False, "number": number},
+        "repository": {"full_name": "o/r"},
+        "installation": {"id": 7},
+    }
+
+
+def test_stop_on_unstarted_handler_is_noop(tmp_path: Path) -> None:
+    """start() 호출 전에 stop() 해도 예외 없이 바로 반환해야 한다.
+
+    lifespan 이 start 전에 예외로 종료되는 경우, stop 이 join 하려다 NoneType 참조로
+    AttributeError 나면 원래 예외를 가려 디버깅이 어려워진다.
+    """
+    handler = _build_handler(
+        FakeGitHub(),
+        FileDump(entries=(), total_chars=0),
+        ReviewResult(summary="ok", event=ReviewEvent.COMMENT),
+        tmp_path,
+    )
+    handler.stop()  # 예외가 나지 않아야 충분
+
+
+def test_stop_logs_error_when_worker_is_stuck_past_timeout(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """데몬 워커가 gemini CLI 등에 묶여 timeout 안에 못 끝나면 드롭 사실이 ERROR 로그로 명시돼야 한다.
+
+    회귀 방지 대상: 이 로그를 잃으면 운영자가 "리뷰가 왜 안 달렸는지" 추적할 근거가
+    없어져 GitHub 에 202 로 응답한 PR 이 조용히 유실된다 (우선순위 #3).
+    """
+    engine = _BlockingEngine(ReviewResult(summary="ok", event=ReviewEvent.COMMENT))
+    handler = _build_handler_with_engine(tmp_path, engine)
+
+    handler.start()
+    try:
+        handler.accept("pull_request", "dstuck", _queued_payload(number=7))
+        assert engine.started.wait(timeout=3.0), "worker never entered review()"
+
+        with caplog.at_level(logging.ERROR):
+            handler.stop(timeout=0.3)
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert error_records, "타임아웃 시 ERROR 로그가 반드시 찍혀야 한다"
+        joined = " | ".join(r.getMessage() for r in error_records)
+        assert "worker did not finish" in joined
+        # in-flight 작업의 delivery_id 와 PR 식별자가 로그에 포함되어야 재시도 가능
+        assert "dstuck" in joined
+        assert "o/r#7" in joined
+    finally:
+        # 데몬 스레드가 프로세스 종료까지 subprocess 안에 매달려 있지 않도록 풀어준다
+        engine.release.set()
+
+
+def test_stop_clears_inflight_after_successful_processing(tmp_path: Path) -> None:
+    """정상 처리 종료 후 _in_flight 가 None 으로 정리돼야 stop() 이 드롭 로그를 오탐 안 찍는다."""
+    github = FakeGitHub()
+    engine = FakeEngine(ReviewResult(summary="ok", event=ReviewEvent.COMMENT))
+    handler = _build_handler_with_engine(tmp_path, engine, github=github)
+
+    handler.start()
+    try:
+        handler.accept("pull_request", "dok", _queued_payload(number=9))
+        # 리뷰 게시까지 완료될 때까지 폴링 대기 (sleep 단일값에 의존하지 않음)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not github.posted_reviews:
+            time.sleep(0.02)
+        assert github.posted_reviews, "review 가 제한 시간 내 게시되지 않았다"
+
+        assert handler._in_flight is None  # type: ignore[attr-defined]
+    finally:
+        handler.stop(timeout=1.0)
