@@ -166,6 +166,8 @@ def test_review_invokes_prompt_mode_with_stdin_placeholder(
     assert captured["cmd"] == ["gemini", "-m", "gemini-2.5-pro", "-p", " "]
     assert "=== PR METADATA ===" in str(captured["input"])
     assert result.summary == "ok"
+    # primary 모델이 그대로 성공한 경우 그 이름이 결과에 주입돼야 한다.
+    assert result.model == "gemini-2.5-pro"
 
 
 def test_review_falls_back_when_preview_model_capacity_is_exhausted(
@@ -201,6 +203,8 @@ def test_review_falls_back_when_preview_model_capacity_is_exhausted(
         "gemini-2.5-pro",
     ]
     assert result.summary == "fallback ok"
+    # fallback 이 발동했으므로 primary 가 아닌 실제 응답을 만든 모델이 결과에 담겨야 한다.
+    assert result.model == "gemini-2.5-pro"
 
 
 def test_review_does_not_fall_back_on_non_retryable_cli_failure(
@@ -263,6 +267,8 @@ def test_review_falls_back_on_premature_stream_close(
         "gemini-2.5-pro",
     ]
     assert result.summary == "recovered via fallback"
+    # 스트림 절단으로 fallback 된 경우에도 실제 응답 모델이 주입돼야 한다.
+    assert result.model == "gemini-2.5-pro"
 
 
 def test_stream_close_markers_are_not_redundant() -> None:

@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import logging
 import subprocess
@@ -127,7 +128,10 @@ class GeminiCliEngine:
         for index, model in enumerate(models):
             result = self._invoke_review(model, prompt, dump)
             if result.returncode == 0:
-                return parse_review(result.stdout)
+                # `parse_review` 는 CLI 출력만 해석하므로 어느 모델이 이 결과를 만들었는지
+                # 모른다. 여기서 한 번에 주입해서 fallback 발동 시 운영자가 본문 푸터로
+                # 실제 사용 모델을 바로 확인할 수 있게 한다.
+                return dataclasses.replace(parse_review(result.stdout), model=model)
 
             last_error = _combined_output(result)
             has_fallback = index + 1 < len(models)
