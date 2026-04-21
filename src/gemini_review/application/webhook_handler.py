@@ -4,6 +4,7 @@ import logging
 import queue
 import threading
 from dataclasses import dataclass
+from typing import Any
 
 from gemini_review.domain import RepoRef
 from gemini_review.interfaces import GitHubClient
@@ -71,7 +72,7 @@ class WebhookHandler:
         self,
         event: str,
         delivery_id: str,
-        payload: dict,
+        payload: dict[str, Any],
     ) -> tuple[int, str]:
         dlog = get_delivery_logger(__name__, delivery_id)
         if event == "ping":

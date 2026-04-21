@@ -38,9 +38,14 @@ def _extract_json(text: str) -> dict[str, object] | None:
     stripped = _strip_code_fence(text.strip())
     if stripped.startswith("{"):
         try:
-            return json.loads(stripped)
+            # json.loads 의 반환 타입은 Any — dict 가 아닌 list/primitive 가 올 수 있으므로
+            # 경계에서 명시적으로 좁혀 선언 타입을 지킨다.
+            parsed = json.loads(stripped)
         except json.JSONDecodeError:
             pass
+        else:
+            if isinstance(parsed, dict):
+                return parsed
 
     # Gemini CLI 는 생각 과정을 로그로 찍은 뒤 최종 JSON 을 맨 뒤에 출력할 수 있다.
     # 중간에 `{"note": "..."}` 같은 디버그 JSON 이 끼어도 최종 리뷰 JSON 은 가장 마지막.
