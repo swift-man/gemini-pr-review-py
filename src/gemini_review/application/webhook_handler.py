@@ -1,8 +1,8 @@
 import hashlib
 import hmac
 import logging
-import queue
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
 from gemini_review.domain import RepoRef
@@ -21,6 +21,10 @@ _SUPPORTED_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
 # 들어오도록 너무 길게 잡지 않는다.
 _DEFAULT_STOP_TIMEOUT_SEC = 10.0
 
+# 기본 동시 리뷰 워커 수. `WebhookHandler(concurrency=...)` 로 주입하지 않은 경우에
+# 한해서만 쓰이는 fallback — 운영은 `config.Settings.review_concurrency` 를 통한다.
+_DEFAULT_CONCURRENCY = 3
+
 
 @dataclass(frozen=True)
 class WebhookJob:
@@ -36,35 +40,57 @@ class WebhookJob:
 
 
 class WebhookHandler:
-    """webhook 을 검증하고 리뷰 작업을 큐에 넣은 뒤 직렬로 소비한다."""
+    """webhook 을 검증하고 리뷰 작업을 ThreadPoolExecutor 에 올린다.
+
+    병렬 정책:
+    - 서로 다른 레포의 리뷰는 최대 `concurrency` 만큼 동시 실행.
+    - **같은 레포** 에 쌓이는 리뷰는 `_repo_locks` 로 직렬화 — git 캐시 디렉터리
+      `~/.gemini-review/repos/{owner}/{name}` 의 동시 `git clone`/`fetch`/`checkout`
+      경합을 방지하기 위함. 이 락은 repo full_name 당 1개, 첫 접근 시 lazy 하게 생성.
+    """
 
     def __init__(
         self,
         secret: str,
         github: GitHubClient,
         use_case: ReviewPullRequestUseCase,
+        concurrency: int = _DEFAULT_CONCURRENCY,
     ) -> None:
+        if concurrency < 1:
+            raise ValueError(f"concurrency must be >= 1, got {concurrency}")
         self._secret = secret.encode("utf-8")
         self._github = github
         self._use_case = use_case
-        self._queue: queue.Queue[WebhookJob] = queue.Queue()
-        self._worker: threading.Thread | None = None
-        self._stop = threading.Event()
-        # 현재 처리 중인 작업 — 종료 시 "어떤 리뷰가 드롭됐는지" 가시화용.
-        # 데이터 레이스를 피하려면 이 필드는 _in_flight_lock 안에서만 읽고 쓴다.
+        self._concurrency = concurrency
+
+        # executor 와 관련 상태는 start/stop 시 교체되므로 전용 락으로 보호한다.
+        self._executor_lock = threading.Lock()
+        self._executor: ThreadPoolExecutor | None = None
+
+        # 진행 중(running 중인 _process) 작업 추적. 종료 시 "어떤 리뷰가 드롭됐는지"
+        # 를 ERROR 로그로 가시화하기 위한 관측성 구조.
         self._in_flight_lock = threading.Lock()
-        self._in_flight: WebhookJob | None = None
+        self._in_flight: dict[str, WebhookJob] = {}
+
+        # submit 된 future → 대응 WebhookJob 매핑. 종료 시 cancel 된 queued future 의
+        # 식별자를 로그로 남기기 위해 유지. done 콜백으로 자동 정리.
+        self._pending_lock = threading.Lock()
+        self._pending: dict[Future[None], WebhookJob] = {}
+
+        # 레포별 직렬화 락. 같은 레포에 대한 _process 호출은 반드시 이 락 안에서 실행.
+        self._repo_locks_lock = threading.Lock()
+        self._repo_locks: dict[str, threading.Lock] = {}
 
     # --- 라이프사이클 --------------------------------------------------------
 
     def start(self) -> None:
-        if self._worker is not None:
-            return
-        self._stop.clear()
-        self._worker = threading.Thread(
-            target=self._run, name="review-worker", daemon=True
-        )
-        self._worker.start()
+        with self._executor_lock:
+            if self._executor is not None:
+                return
+            self._executor = ThreadPoolExecutor(
+                max_workers=self._concurrency,
+                thread_name_prefix="review-worker",
+            )
 
     def stop(self, timeout: float = _DEFAULT_STOP_TIMEOUT_SEC) -> None:
         """워커에게 중단 신호를 보낸 뒤 `timeout` 초까지 완료를 기다린다.
@@ -73,67 +99,59 @@ class WebhookHandler:
         리뷰 중이던 작업이 GitHub 에 202 로 접수된 채 영구 유실됐다.
         (우선순위 #3 — 데이터 손실 / 상태 불일치)
 
-        본 구현은 데몬 스레드를 유지해 uvicorn 이 끝내 종료될 수 있게 하면서,
-        idle 큐 drain 과 짧은 리뷰가 자연스럽게 끝날 시간을 준다. gemini CLI 호출
-        중인 대형 리뷰는 timeout 을 초과해도 드롭되지만, 그 때는 **어떤 작업이
-        유실됐는지** 를 ERROR 로그에 명시해 운영자가 재시도(빈 커밋 push 등) 할
-        근거를 남긴다.
+        본 구현은:
+        - 아직 시작되지 않은 queued future 를 즉시 취소 (`cancel_futures=True`)
+        - 이미 실행 중인 future 는 `timeout` 초까지 완료를 대기
+        - 마감 내 못 끝난 running / 취소된 queued 식별자를 **모두 ERROR 로그로**
+          남겨 운영자가 영향받은 PR 에 빈 커밋 push 등으로 재시도 가능하도록.
         """
-        worker = self._worker
-        if worker is None:
-            return
+        with self._executor_lock:
+            executor = self._executor
+            if executor is None:
+                return
+            # 이후 `_submit` 이 새 작업을 밀어 넣지 않도록 레퍼런스를 먼저 떼어낸다.
+            self._executor = None
 
-        with self._in_flight_lock:
-            in_flight_snapshot = self._in_flight
-        queued_before = self._queue.qsize()
+        # 종료 시점 스냅샷 — 아래 분석의 기준이 된다.
+        with self._pending_lock:
+            pending_snapshot = dict(self._pending)
 
-        if in_flight_snapshot is not None or queued_before > 0:
+        running = [f for f, _ in pending_snapshot.items() if f.running()]
+        not_started = [
+            f for f, _ in pending_snapshot.items() if not f.running() and not f.done()
+        ]
+
+        if running or not_started:
             logger.warning(
-                "shutting down with pending work — in_flight=%s, queued=%d; "
+                "shutting down with pending work — running=%d, queued=%d; "
                 "waiting up to %.1fs for graceful completion",
-                in_flight_snapshot or "none",
-                queued_before,
+                len(running),
+                len(not_started),
                 timeout,
             )
 
-        self._stop.set()
-        worker.join(timeout=timeout)
+        # 아직 시작 안 된 future 는 즉시 cancel, 실행 중인 것은 자연 완료 대기.
+        executor.shutdown(wait=False, cancel_futures=True)
+        if running:
+            wait(running, timeout=timeout)
 
-        if worker.is_alive():
-            # 워커가 timeout 안에 안 끝남 — 데몬이라 프로세스 종료 시 강제로 죽는다.
-            # worker 는 이 시점 이전에 이미 _stop 신호로 get() 루프를 벗어났어야 하지만,
-            # _process 내부 블로킹(gemini CLI) 으로 묶여 있는 경우도 있다. 어쨌든 큐에는
-            # 더 이상 손대지 않으므로 내부 deque 스냅샷이 안정.
-            with self._in_flight_lock:
-                still_in_flight = self._in_flight
-            remaining_jobs = self._snapshot_queue()
+        # 마감 후에도 안 끝난 실행 중 작업 + 취소된 queued 작업을 로그에 남긴다.
+        still_running_jobs = [
+            pending_snapshot[f] for f in running if not f.done()
+        ]
+        cancelled_jobs = [
+            pending_snapshot[f] for f in not_started if f.cancelled() or not f.done()
+        ]
+
+        if still_running_jobs or cancelled_jobs:
             logger.error(
-                "worker did not finish within %.1fs; review in-flight=%s, "
-                "remaining_queue=[%s] may be lost. "
+                "worker did not finish within %.1fs; "
+                "running=[%s], cancelled_queued=[%s] may be lost. "
                 "operator: re-trigger the affected PR(s) with an empty commit.",
                 timeout,
-                still_in_flight or "none",
-                ", ".join(str(job) for job in remaining_jobs) or "empty",
+                ", ".join(str(j) for j in still_running_jobs) or "none",
+                ", ".join(str(j) for j in cancelled_jobs) or "none",
             )
-            # _worker 는 일부러 정리하지 않는다. 스레드 객체가 아직 살아 있는 상태에서
-            # 레퍼런스를 지우면 후속 start() 가 좀비 옆에 새 워커를 띄워 중복 실행된다.
-            return
-
-        # 정상 종료 — 인스턴스가 start() 로 재사용될 수 있도록 스레드 레퍼런스 초기화.
-        # (운영상 같은 인스턴스 재사용은 드물지만, lifespan 이 restart 되거나 테스트가
-        #  한 인스턴스를 stop/start 순서로 검증하는 경우 필요.)
-        self._worker = None
-
-    def _snapshot_queue(self) -> list[WebhookJob]:
-        """락을 잡고 내부 deque 를 얕은 복사로 찍는다 — 드롭 대상 식별용.
-
-        `Queue.mutex` 는 문서화된 락이며 여기서 잠깐 잡아 스냅샷만 떠 나와도 워커가
-        어차피 `_stop` 이후 get() 하지 않으므로 경합 위험이 없다. `qsize()` 만으로는
-        "몇 개가 있었는지" 밖에 모르고 "어떤 PR 이었는지" 를 놓치는데, 드롭 대상 재시도
-        안내가 이 PR 의 핵심 목적이라 식별자가 필요.
-        """
-        with self._queue.mutex:
-            return list(self._queue.queue)
 
     # --- 서명 검증 ----------------------------------------------------------
 
@@ -196,47 +214,74 @@ class WebhookHandler:
             number=number,
             installation_id=installation_id,
         )
-        self._queue.put(job)
+        submitted = self._submit(job)
+        if not submitted:
+            # start() 전이거나 stop() 이후 — 이 경우 운영상 이슈이므로 GitHub 가
+            # 재전송을 시도하도록 5xx 대신 명시적 4xx 로 돌려주지 않고, 그냥 202 ignored
+            # 로 처리하면 GitHub 쪽에는 성공처럼 보여 더 조용히 유실된다. 굳이 구분하자.
+            dlog.warning("handler not running — dropped job for %s#%d", repo_full, number)
+            return 503, "not-running"
+
         dlog.info(
-            "queued review for %s#%d (queue_depth=%d)",
+            "queued review for %s#%d (pending=%d)",
             job.repo.full_name,
             job.number,
-            self._queue.qsize(),
+            self._pending_count(),
         )
         return 202, "queued"
 
-    # --- 워커 ---------------------------------------------------------------
+    # --- 내부 ---------------------------------------------------------------
 
-    def _run(self) -> None:
-        # 완전 직렬화: 한 번에 한 리뷰만 돌린다(동시성 1). Gemini CLI 가 사용자 Google
-        # OAuth 토큰을 공유하므로 동시 호출은 rate-limit 에 걸릴 위험이 크고, `gemini -p` 가
-        # 리뷰 하나당 수 분 수준이라 큐가 길어져도 순차 처리가 운영상 단순하기 때문.
-        while not self._stop.is_set():
-            try:
-                # timeout 으로 주기적으로 깨어나 _stop 을 확인. 이렇게 해야 서버 종료 시 블로킹 없이
-                # 스레드가 빠져나온다.
-                job = self._queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-            self._process(job)
-            self._queue.task_done()
+    def _submit(self, job: WebhookJob) -> bool:
+        """executor 에 job 을 submit 하고 pending 맵에 등록. executor 없으면 False."""
+        with self._executor_lock:
+            executor = self._executor
+            if executor is None:
+                return False
+            future = executor.submit(self._process, job)
+        with self._pending_lock:
+            self._pending[future] = job
+        future.add_done_callback(self._on_future_done)
+        return True
+
+    def _on_future_done(self, future: Future[None]) -> None:
+        with self._pending_lock:
+            self._pending.pop(future, None)
+
+    def _pending_count(self) -> int:
+        with self._pending_lock:
+            return len(self._pending)
+
+    def _get_repo_lock(self, repo: RepoRef) -> threading.Lock:
+        """레포별 직렬화 락. 같은 full_name 으로 오는 리뷰는 이 락을 공유한다.
+
+        락 맵은 소거하지 않는다 — threading.Lock 자체는 수십 바이트이고, 한 번 리뷰된
+        레포가 사라지는 시나리오가 없어 누수 우려 없음. 필요해지면 LRU 로 감쌀 것.
+        """
+        with self._repo_locks_lock:
+            return self._repo_locks.setdefault(repo.full_name, threading.Lock())
 
     def _process(self, job: WebhookJob) -> None:
         dlog = get_delivery_logger(__name__, job.delivery_id)
         with self._in_flight_lock:
-            self._in_flight = job
+            self._in_flight[job.delivery_id] = job
         try:
-            dlog.info("processing %s#%d", job.repo.full_name, job.number)
-            pr = self._github.fetch_pull_request(job.repo, job.number, job.installation_id)
-            if pr.is_draft:
-                dlog.info("skipping draft at fetch time")
-                return
-            self._use_case.execute(pr)
-            dlog.info("done %s#%d", job.repo.full_name, job.number)
+            # 같은 레포 안에서의 git 캐시 경합을 피하기 위한 직렬화. 서로 다른 레포의
+            # 리뷰는 이 락을 공유하지 않으므로 병렬로 돌아간다.
+            with self._get_repo_lock(job.repo):
+                dlog.info("processing %s#%d", job.repo.full_name, job.number)
+                pr = self._github.fetch_pull_request(
+                    job.repo, job.number, job.installation_id
+                )
+                if pr.is_draft:
+                    dlog.info("skipping draft at fetch time")
+                    return
+                self._use_case.execute(pr)
+                dlog.info("done %s#%d", job.repo.full_name, job.number)
         except Exception:
             dlog.exception("review failed for %s#%d", job.repo.full_name, job.number)
         finally:
             # in-flight 기록은 성공·실패·예외 모두에서 정확히 지워져야 stop() 시점의
             # "드롭된 작업" 로그가 거짓 양성(false positive) 으로 안 찍힌다.
             with self._in_flight_lock:
-                self._in_flight = None
+                self._in_flight.pop(job.delivery_id, None)

@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     host: str = Field(default="127.0.0.1", alias="HOST")
     port: int = Field(default=8000, alias="PORT")
     dry_run: bool = Field(default=False, alias="DRY_RUN")
+    # 병렬 리뷰 워커 수. 같은 레포에 쌓이는 리뷰는 레포 캐시 디렉터리 락 때문에
+    # 어차피 직렬화되지만, 서로 다른 레포의 리뷰는 이 값만큼 동시에 진행한다.
+    # OAuth 쿼터가 여유 있다는 전제에서 3이 무난 (동시 `git clone`/`gemini CLI`
+    # 프로세스 수 상한이기도 함).
+    review_concurrency: int = Field(default=3, alias="REVIEW_CONCURRENCY")
 
     def load_private_key(self) -> str:
         if self.github_app_private_key:
