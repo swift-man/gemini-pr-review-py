@@ -119,3 +119,42 @@ def test_prompt_bans_noise_patterns() -> None:
     assert "깔끔합니다" in prompt
     # 변경 안 된 부분 억지 지적 금지 규칙
     assert "억지" in prompt or "지적 수를 채우려" in prompt
+
+
+def test_prompt_defines_four_line_comment_severity_tiers() -> None:
+    """4개 등급이 모두 명시돼 있고, 각 등급의 대표 판정 기준 중 하나 이상이 포함돼야 한다.
+
+    회귀 방지: 등급 정의가 누락되면 모델이 접두사를 생략하거나 임의 등급(예: `[Info]`,
+    `[Warning]`) 을 만들어 UI 필터/그레핑 규칙이 깨진다.
+    """
+    dump = FileDump(entries=(), total_chars=0)
+    prompt = build_prompt(_pr(), dump)
+
+    # 4개 영문 태그 모두 대괄호 형태로 등장해야 한다 (외부 스크립트 그레핑 호환).
+    for tier in ("[Critical]", "[Major]", "[Minor]", "[Suggestion]"):
+        assert tier in prompt, f"등급 태그 {tier} 누락"
+
+    # 각 등급의 대표 판정 기준도 적어도 하나씩 프롬프트에 들어 있어야 한다.
+    # 모델이 등급 선택 시 참조할 기준점.
+    assert "데이터 손실" in prompt
+    assert "버그 가능성" in prompt or "예외 처리 누락" in prompt
+    assert "가독성" in prompt or "중복 코드" in prompt or "네이밍" in prompt
+    assert "취향 차이" in prompt or "리팩터링 아이디어" in prompt or "선택 제안" in prompt
+
+
+def test_prompt_schema_shows_grade_prefix_for_comment_body() -> None:
+    """스키마 예시의 `body` 필드에 `[등급]` 접두사가 명시돼야 한다.
+
+    모델은 JSON 스키마 예시를 가장 강하게 따라가므로, 이 자리에 접두사가 없으면 본문
+    규칙을 아무리 자세히 써도 생략될 확률이 올라간다. 스키마와 규칙 양쪽에 동시에
+    박아 두는 것이 실효.
+    """
+    dump = FileDump(entries=(), total_chars=0)
+    prompt = build_prompt(_pr(), dump)
+
+    assert '"[<등급>] <해당 라인에 달릴 기술 단위 코멘트' in prompt
+
+    # event 결정이 등급과 연동된다는 규칙도 들어 있어야 Critical 이 있을 때 모델이
+    # COMMENT 로 내보내지 않게 된다.
+    assert "REQUEST_CHANGES" in prompt
+    assert "Critical" in prompt  # event 규칙 섹션에서 등장
