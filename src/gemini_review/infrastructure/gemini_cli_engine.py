@@ -126,7 +126,30 @@ class GeminiCliEngine:
         models = _dedupe_models(self._model, self._fallback_models)
         last_error = ""
         for index, model in enumerate(models):
-            result = self._invoke_review(model, prompt, dump)
+            has_fallback = index + 1 < len(models)
+
+            # TimeoutExpired 는 Python 예외라 stderr 마커 검사를 거치지 않는다. preview 모델이
+            # 긴 프롬프트에 응답 못 하는 건 전형적 retryable 실패이므로 여기서 잡아 fallback
+            # 체인에 태운다. 이 블록을 _invoke_review 내부에서 RuntimeError 로 변환하면
+            # 루프 자체를 빠져나가 fallback 이 발동하지 않는 회귀가 생긴다.
+            try:
+                result = self._invoke_review(model, prompt, dump)
+            except subprocess.TimeoutExpired:
+                if not has_fallback:
+                    raise RuntimeError(
+                        f"gemini -p timed out after {self._timeout_sec}s on all "
+                        f"{len(models)} model(s)"
+                    ) from None
+                fallback = models[index + 1]
+                logger.warning(
+                    "gemini timed out after %ds on %s; falling back to %s",
+                    self._timeout_sec,
+                    model,
+                    fallback,
+                )
+                last_error = f"timed out after {self._timeout_sec}s"
+                continue
+
             if result.returncode == 0:
                 # `parse_review` 는 CLI 출력만 해석하므로 어느 모델이 이 결과를 만들었는지
                 # 모른다. 여기서 한 번에 주입해서 fallback 발동 시 운영자가 본문 푸터로
@@ -134,7 +157,6 @@ class GeminiCliEngine:
                 return dataclasses.replace(parse_review(result.stdout), model=model)
 
             last_error = _combined_output(result)
-            has_fallback = index + 1 < len(models)
             if has_fallback and _is_retryable_model_failure(last_error):
                 fallback = models[index + 1]
                 logger.warning(
@@ -174,19 +196,16 @@ class GeminiCliEngine:
             dump.total_chars,
             model,
         )
-        try:
-            return subprocess.run(  # noqa: S603
-                cmd,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout_sec,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"gemini -p timed out after {self._timeout_sec}s"
-            ) from exc
+        # TimeoutExpired 는 일부러 잡지 않고 그대로 propagate — caller 인 `review()` 가
+        # fallback 체인 결정을 한 곳에 모아서 처리한다 (returncode≠0 케이스와 동일 정책).
+        return subprocess.run(  # noqa: S603
+            cmd,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=self._timeout_sec,
+            check=False,
+        )
 
 
 def _dedupe_models(primary: str, fallback_models: tuple[str, ...]) -> tuple[str, ...]:

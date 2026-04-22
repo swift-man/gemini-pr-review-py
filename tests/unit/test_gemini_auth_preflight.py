@@ -290,3 +290,72 @@ def test_stream_close_markers_are_not_redundant() -> None:
     # 따라서 두 마커 중 하나만 남기면 나머지 형태는 커버리지에서 빠진다.
     assert "premature close" not in code_form.lower()
     assert "err_stream_premature_close" not in prose_form.lower()
+
+
+def test_review_falls_back_on_subprocess_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`subprocess.TimeoutExpired` 가 fallback 체인을 우회하지 않고 다음 모델로 넘어가야 한다.
+
+    회귀 방지: timeout 은 stderr 마커가 아니라 Python 예외로 도착해 `_is_retryable_model_failure`
+    검사를 거치지 않는다. 만약 `_invoke_review` 내부에서 RuntimeError 로 변환하면 `review()`
+    의 model 루프 자체를 빠져나가 fallback 이 발동 못하고 PR 이 조용히 유실된다 (실관측됨).
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompleted:
+        calls.append(cmd)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 0))
+        return _FakeCompleted(
+            0,
+            '{"summary": "recovered after timeout", "event": "COMMENT", "comments": []}',
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = GeminiCliEngine(
+        binary="gemini",
+        model="gemini-3.1-pro-preview",
+        fallback_models=("gemini-2.5-pro",),
+        timeout_sec=600,
+    ).review(_sample_pr(), FileDump(entries=(), total_chars=0))
+
+    assert [cmd[2] for cmd in calls] == [
+        "gemini-3.1-pro-preview",
+        "gemini-2.5-pro",
+    ]
+    assert result.summary == "recovered after timeout"
+    assert result.model == "gemini-2.5-pro"
+
+
+def test_review_raises_when_all_models_time_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fallback 체인의 모든 모델이 timeout 인 경우엔 RuntimeError 로 끝나야 한다.
+
+    안전망: 첫 모델만 timeout → fallback 성공이 정상 경로지만, **마지막 모델까지** timeout
+    이면 더 이상 시도할 곳이 없으므로 명시적 RuntimeError 로 _process 의 ERROR 로깅 경로에
+    들어가야 한다 (운영자가 timeout 한도/네트워크 환경을 점검할 신호).
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompleted:
+        calls.append(cmd)
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match=r"timed out .* on all 2 model"):
+        GeminiCliEngine(
+            binary="gemini",
+            model="gemini-3.1-pro-preview",
+            fallback_models=("gemini-2.5-pro",),
+            timeout_sec=600,
+        ).review(_sample_pr(), FileDump(entries=(), total_chars=0))
+
+    # 두 모델 모두 호출돼야 하며 (체인 끝까지 시도), 그 이후에도 더 시도하지 않는다.
+    assert [cmd[2] for cmd in calls] == [
+        "gemini-3.1-pro-preview",
+        "gemini-2.5-pro",
+    ]
