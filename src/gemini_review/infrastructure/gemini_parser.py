@@ -12,6 +12,11 @@ _JSON_BLOCK = re.compile(r"\{(?:[^{}]|\{[^{}]*\})*\}", re.DOTALL)
 _CODE_FENCE_OPEN = re.compile(r"^```(?:json|JSON)?\s*", re.MULTILINE)
 _CODE_FENCE_CLOSE = re.compile(r"\s*```\s*$", re.MULTILINE)
 
+# 라인 코멘트 body 는 "[Critical]" / "[Major]" / "[Minor]" / "[Suggestion]" 접두사로 시작해야
+# 한다 (프롬프트 강제 규약). 여기선 **하드 드롭 없이** 누락/오태그만 WARN 으로 찍어 운영
+# 관측성을 확보한다. 실관측 빈도가 높아지면 드롭/정규화로 강화.
+_SEVERITY_PREFIX = re.compile(r"^\[(Critical|Major|Minor|Suggestion)\] ")
+
 
 def parse_review(raw: str) -> ReviewResult:
     payload = _extract_json(raw)
@@ -91,8 +96,27 @@ def _parse_findings(raw: object) -> list[Finding]:
         # 코멘트"만 인라인 대상이며, 나머지 거시적 지적은 improvements 섹션으로 모델이 분류해야 한다.
         if not path or not body or line is None:
             continue
+        _warn_if_missing_severity_tag(path, line, body)
         out.append(Finding(path=path, line=line, body=body))
     return out
+
+
+def _warn_if_missing_severity_tag(path: str, line: int, body: str) -> None:
+    """프롬프트 규약대로 `[Critical|Major|Minor|Suggestion]` 접두사가 없으면 경고 로깅.
+
+    설계 선택: 게시는 그대로 진행하고 로그만 남긴다 (하드 드롭·정규화 안 함). 이유는
+    (1) 운영자가 누락 빈도를 먼저 관찰할 근거가 필요하고, (2) 일부 모델 출력에서만
+    누락된다면 태그 없는 코멘트도 본문 가치는 있을 수 있어서. 실측으로 높은 비율의
+    누락이 보이면 그 때 드롭/정규화 레이어로 강화한다.
+    """
+    if not _SEVERITY_PREFIX.match(body):
+        logger.warning(
+            "comment body lacks severity tag prefix (expected one of "
+            "[Critical|Major|Minor|Suggestion]): path=%s line=%d body=%r",
+            path,
+            line,
+            body[:120],
+        )
 
 
 def _coerce_line(value: object) -> int | None:

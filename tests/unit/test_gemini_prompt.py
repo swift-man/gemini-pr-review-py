@@ -154,7 +154,18 @@ def test_prompt_schema_shows_grade_prefix_for_comment_body() -> None:
 
     assert '"[<등급>] <해당 라인에 달릴 기술 단위 코멘트' in prompt
 
-    # event 결정이 등급과 연동된다는 규칙도 들어 있어야 Critical 이 있을 때 모델이
-    # COMMENT 로 내보내지 않게 된다.
-    assert "REQUEST_CHANGES" in prompt
-    assert "Critical" in prompt  # event 규칙 섹션에서 등장
+    # event 결정이 **등급과 연동되는 맥락** 안에서 기술돼 있어야 한다. 단순히 두 단어가
+    # 프롬프트 어딘가에 각각 존재하는 것만으로는 모델이 "Critical → REQUEST_CHANGES"
+    # 의 관계를 읽지 못할 수 있다. 등급 섹션 블록을 잘라내서 그 안에서 "Critical" 이
+    # 먼저 등장하고 그 **뒤에** "REQUEST_CHANGES" 가 등장하는지까지 고정한다.
+    start = prompt.index("## 라인 코멘트 등급")
+    end_candidate = prompt.find("## ", start + len("## 라인 코멘트 등급"))
+    severity_section = prompt[start:end_candidate] if end_candidate != -1 else prompt[start:]
+
+    critical_pos = severity_section.find("Critical")
+    assert critical_pos != -1, "등급 섹션 안에서 Critical 이 언급돼야 함"
+    request_changes_pos = severity_section.find("REQUEST_CHANGES", critical_pos)
+    assert request_changes_pos != -1, (
+        "등급 섹션에서 Critical 이후에 REQUEST_CHANGES 가 등장해야 한다 — "
+        "두 키워드가 '연결된 규칙' 으로 서술돼야 모델이 맥락을 읽는다"
+    )

@@ -53,7 +53,7 @@ SYSTEM_RULES = """\
 예:
 - `"body": "[Critical] sys.exit(1) 호출이 uvicorn 프로세스 전체를 종료시켜 진행 중인 다른 리뷰까지 유실됩니다. raise HTTPException(...) 으로 교체하세요."`
 - `"body": "[Major] except Exception 이 OAuth 만료 에러까지 조용히 삼켜 재인증 필요성이 운영자에게 전달되지 않습니다. GeminiAuthError 만 별도로 catch 해 CRITICAL 로그 + 알람 보내세요."`
-- `"body": "[Minor] 변수명 \\`_exc\\` 가 흐름을 해치지 않는 예외를 가리지만 \\`ignored\\` 같은 의도를 드러내는 이름이 읽기 좋습니다."`
+- `"body": "[Minor] 변수명 _exc 가 흐름을 해치지 않는 예외를 가리지만 ignored 같은 의도를 드러내는 이름이 읽기 좋습니다."`
 - `"body": "[Suggestion] 이 dataclass 들이 모두 frozen=True 이니 slots=True 를 함께 걸면 메모리/속도가 약간 개선됩니다 (선택)."`
 
 `event` 결정은 등급 분포와 연동합니다:

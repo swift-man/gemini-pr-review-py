@@ -121,14 +121,32 @@ REPO_FULL_NAME=owner/repo PR_NUMBER=1 INSTALLATION_ID=1234567 \
   "positives":    ["좋은 점 ..."],
   "improvements": ["개선할 점 (파일/모듈/아키텍처 단위) ..."],
   "comments": [
-    {"path": "src/x.py", "line": 42, "body": "기술 단위 코멘트 (라인 고정)"}
+    {"path": "src/x.py", "line": 42, "body": "[Critical|Major|Minor|Suggestion] 기술 단위 코멘트 (라인 고정)"}
   ]
 }
 ```
 
 - `positives` → PR 리뷰 본문 "**좋은 점**" 섹션으로 렌더
 - `improvements` → 본문 "**개선할 점**" 섹션으로 렌더
-- `comments` → GitHub 인라인 리뷰 코멘트로 라인에 붙음 (**line 필수**)
+- `comments` → GitHub 인라인 리뷰 코멘트로 라인에 붙음 (**line 필수**, **`[등급]` 접두사 필수**)
+
+### 라인 코멘트 등급 (`comments[].body` 접두사)
+
+각 인라인 코멘트의 본문은 반드시 다음 4개 영문 태그 중 하나로 시작합니다:
+
+| 태그 | 의미 |
+|---|---|
+| `[Critical]` | 반드시 막아야 하는 문제 — 장애 가능성 / 데이터 손실 / 보안 / 크래시 |
+| `[Major]` | merge 전에 고치는 게 좋은 문제 — 버그 / 예외 누락 / 동시성 / 큰 테스트 누락 |
+| `[Minor]` | 당장 큰 문제는 아니지만 개선 가치 — 가독성 / 중복 / 네이밍 |
+| `[Suggestion]` | 선택 제안 — 더 나은 방식 / 취향 / 리팩터링 아이디어 |
+
+`event` 결정은 등급 분포와 연동됩니다. `[Critical]` 이 하나라도 있으면 `REQUEST_CHANGES`,
+없으면 `[Major]` 분포에 따라 `COMMENT`/`REQUEST_CHANGES`, 그 이하만 있으면 `COMMENT`/`APPROVE`.
+
+> 운영 메모: 모델이 접두사를 누락하거나 임의 태그(`[Info]` 등) 를 만들면 `gemini_parser`
+> 가 게시 자체는 진행하면서 WARN 로그로 관측합니다 (하드 드롭 안 함). 빈도가 높게 관찰
+> 되면 정규화 레이어로 강화 검토.
 
 ### 기술 단위 코멘트의 취향
 
