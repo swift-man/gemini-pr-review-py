@@ -105,8 +105,14 @@ class GitHubAppClient:
         # 해결: /files 끝낸 뒤 /pulls/{n} 을 다시 한 번 짚어 head_sha 가 그대로인지 확인.
         # 변했다면 한 번 더 같은 SHA 로 다시 받도록 재시도. 무한 루프 회피를 위해
         # _MAX_FETCH_ATTEMPTS 로 제한 — force-push 폭주는 운영자가 알아채야 한다.
+        #
+        # 호출 절감: 재시도 시 직전 iteration 의 `recheck` 결과를 다음 `pr_data` 로 그대로
+        # 재사용한다. 이렇게 하면 N 회 시도 시 `/pulls` 호출이 2N 회가 아니라 N+1 회로
+        # 줄어든다 (gemini PR #19 review #1).
+        pr_data: dict[str, Any] | None = None
         for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
-            pr_data = self._request_object("GET", pr_url, auth=f"token {token}")
+            if pr_data is None:
+                pr_data = self._request_object("GET", pr_url, auth=f"token {token}")
             initial_sha = str(pr_data["head"]["sha"])
             changed, addable = self._fetch_files_for_pr(pr_url, token)
 
@@ -132,16 +138,22 @@ class GitHubAppClient:
                     addable_lines=tuple(addable),
                 )
 
-            logger.warning(
-                "PR %s#%d head_sha changed during fetch (%s -> %s); "
-                "retrying attempt %d/%d to get a consistent snapshot",
-                repo.full_name,
-                number,
-                initial_sha,
-                rechecked_sha,
-                attempt,
-                _MAX_FETCH_ATTEMPTS,
-            )
+            # 다음 iteration 은 이 recheck 결과를 시작점으로 — 여분의 /pulls 호출 회피.
+            pr_data = recheck
+
+            # 마지막 시도라면 곧바로 RuntimeError 로 빠진다 — "retrying" 표기는 거짓.
+            # 실제 재시도가 일어날 때만 로깅 (gemini PR #19 review #2).
+            if attempt < _MAX_FETCH_ATTEMPTS:
+                logger.warning(
+                    "PR %s#%d head_sha changed during fetch (%s -> %s); "
+                    "retrying attempt %d/%d to get a consistent snapshot",
+                    repo.full_name,
+                    number,
+                    initial_sha,
+                    rechecked_sha,
+                    attempt + 1,
+                    _MAX_FETCH_ATTEMPTS,
+                )
 
         # 여기에 도달했다는 건 매 시도마다 head_sha 가 바뀌었다는 뜻 — 사용자가
         # 지속적으로 force push 하고 있는 상태. 조용히 잘못된 데이터로 진행하기보다

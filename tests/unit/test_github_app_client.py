@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import ssl
 import urllib.error
 import urllib.request
@@ -615,11 +616,13 @@ def test_fetch_pull_request_retries_when_head_sha_changes_mid_fetch(
     회귀 방지: 재시도 로직이 빠지면 첫 시도의 어긋난 데이터를 그대로 PullRequest 에
     박아 후속 인라인 분할이 깨진다. 두 번째 시도에서 head_sha 가 안정되면 그 SHA 의
     일관된 스냅샷으로 정상 반환해야 한다.
-    """
-    import logging
 
-    # 1차: pulls=abc → files → pulls=def (변경 감지) ⇒ 재시도
-    # 2차: pulls=def → files → pulls=def (안정) ⇒ 확정
+    호출 절감 검증도 포함: 1차의 recheck 결과를 2차의 시작점으로 재사용하므로 /pulls
+    호출은 (1차 initial + 1차 recheck + 2차 recheck) = 3 회. 4 회로 보이면 재사용
+    최적화가 회귀.
+    """
+    # 1차: pulls=abc → files → pulls=def (변경 감지) ⇒ 재시도, recheck=def 를 carry
+    # 2차: (carried pr_data, sha=def) → files → pulls=def (안정) ⇒ 확정
     fake, counters = _build_fake_urlopen_for_fetch_pr(
         head_shas=["abc", "def", "def", "def"]
     )
@@ -630,8 +633,8 @@ def test_fetch_pull_request_retries_when_head_sha_changes_mid_fetch(
     with caplog.at_level(logging.WARNING):
         pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
 
-    # /pulls 4번 (1차: 2 + 2차: 2), /files 2번 (1차 1 + 2차 1)
-    assert counters["pulls"] == 4
+    # /pulls 3번 (initial 1 + recheck 1 + 2차 recheck 1) — recheck 재사용으로 4→3
+    assert counters["pulls"] == 3
     assert counters["files"] == 2
     # 두 번째 시도의 안정된 SHA 가 박혀야 한다
     assert pr.head_sha == "def"
@@ -644,11 +647,16 @@ def test_fetch_pull_request_retries_when_head_sha_changes_mid_fetch(
 
 def test_fetch_pull_request_raises_when_head_sha_keeps_changing(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """매 시도마다 head_sha 가 바뀌면(force-push 폭주) 무한 retry 대신 명시적 실패.
 
     조용히 잘못된 데이터로 진행하는 것이 가장 위험한 실패 모드 — 차라리 webhook 큐
     수준에서 빼버리고 다음 push 의 새 webhook 이 새 시작점이 되도록 하는 게 안전.
+
+    회귀 방지: 마지막 시도에서 "retrying" 로그가 더 안 찍히는지도 함께 확인. 안 그러면
+    "retry 한다고 했는데 곧바로 실패" 라는 이상한 로그 흐름이 운영자를 혼란시킨다
+    (gemini PR #19 review #2). _MAX_FETCH_ATTEMPTS=3 이면 retry 로그는 최대 2건.
     """
     # 매번 다른 SHA 를 돌려주는 시퀀스 — 어떤 시도도 안정되지 않음
     fake, _counters = _build_fake_urlopen_for_fetch_pr(
@@ -658,8 +666,16 @@ def test_fetch_pull_request_raises_when_head_sha_keeps_changing(
     monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
 
     client = GitHubAppClient(app_id=1, private_key_pem="-")
-    with pytest.raises(RuntimeError, match="head_sha kept changing"):
-        client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(RuntimeError, match="head_sha kept changing"):
+            client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # _MAX_FETCH_ATTEMPTS=3 → 1차·2차 mismatch 시 "retrying" 로그, 3차는 곧바로 raise.
+    # retry 로그는 정확히 2건 (3차에서 거짓 retry 메시지가 찍히면 회귀).
+    retry_warns = [r for r in caplog.records if "retrying attempt" in r.getMessage()]
+    assert len(retry_warns) == 2, (
+        "마지막 시도에선 retry 로그가 찍히면 안 된다 — 곧바로 RuntimeError 로 빠진다"
+    )
 
 
 def test_http_attaches_response_detail_to_httperror(
