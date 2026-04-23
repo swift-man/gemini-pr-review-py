@@ -41,11 +41,15 @@ def test_parse_strips_markdown_code_fence() -> None:
 
 
 def test_parse_picks_last_valid_json_when_reasoning_precedes() -> None:
+    # REQUEST_CHANGES 가 정당하려면 [Critical]/[Major] 가 살아남아야 한다 — 정규화 규칙
+    # (`_normalize_event`) 때문. 이 테스트의 본 목적인 "마지막 JSON 채택" 을 깨지 않도록
+    # 한 건의 Critical 인라인 코멘트를 함께 넣어 REQUEST_CHANGES 가 유지되게 한다.
     raw = (
         "사고 과정: 먼저 파일을 확인...\n"
         '{"note": "intermediate"}\n'
-        'Final:\n'
-        '{"summary": "최종 리뷰", "event": "REQUEST_CHANGES", "comments": []}'
+        "Final:\n"
+        '{"summary": "최종 리뷰", "event": "REQUEST_CHANGES", '
+        '"comments": [{"path": "x.py", "line": 1, "body": "[Critical] 차단 사유"}]}'
     )
     result = parse_review(raw)
     assert result.summary == "최종 리뷰"
@@ -170,8 +174,11 @@ def test_parse_drops_finding_on_path_not_in_valid_paths(
     assert "tests/imaginary.py" in drop_warnings[0].getMessage()
 
 
-def test_parse_skips_path_grounding_when_valid_paths_empty() -> None:
-    """`valid_paths` 가 빈 frozenset 이면 검증 생략 — 단위 테스트 호환성 보장."""
+def test_parse_skips_path_grounding_when_valid_paths_is_none() -> None:
+    """`valid_paths=None` (default) 이면 검증 생략 — 단위 테스트 호환성 보장.
+
+    None sentinel 이 "검증 안 함" 의미. 빈 frozenset 과 분리된 의미를 갖는다 (별도 테스트).
+    """
     raw = """
     {
       "summary": "ok",
@@ -181,9 +188,35 @@ def test_parse_skips_path_grounding_when_valid_paths_empty() -> None:
       ]
     }
     """
-    result = parse_review(raw)  # valid_paths 미지정 → 검증 안 함
+    result = parse_review(raw)  # valid_paths 미지정 (None) → 검증 안 함
     assert len(result.findings) == 1
     assert result.findings[0].path == "any/path.py"
+
+
+def test_parse_drops_all_findings_when_valid_paths_is_empty_frozenset(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`valid_paths=frozenset()` (명시적 빈 집합) 은 "PR 변경 파일 0개" 의미 — 모두 드롭.
+
+    None sentinel vs 빈 frozenset 의 의미 분리를 회귀 방지. 빈 frozenset 도 "검증 안 함"
+    으로 취급되던 옛 동작을 되살리면, 실제로 변경 파일이 0개인 PR 에서 환각 finding 이
+    살아남는 사고가 다시 나타난다. 호출부가 의도를 명시할 수 있는 두 갈래를 보장.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "COMMENT",
+      "comments": [
+        {"path": "anything.py", "line": 1, "body": "[Minor] x"}
+      ]
+    }
+    """
+    with caplog.at_level(logging.WARNING):
+        result = parse_review(raw, valid_paths=frozenset())
+
+    assert result.findings == (), "빈 valid_paths 는 모든 finding 을 드롭해야 한다"
+    drop_warns = [r for r in caplog.records if "non-changed path" in r.getMessage()]
+    assert len(drop_warns) == 1
 
 
 # --- Severity downgrade on hallucination (사용자 신고 사례 1·4 차단) --------
@@ -219,6 +252,14 @@ def test_parse_downgrades_critical_to_suggestion_on_literal_n_hallucination(
     # 강등 사실이 WARN 으로 로깅됨 — 운영자가 빈도 추적 가능
     downgrade_warnings = [r for r in caplog.records if "downgrading severity" in r.getMessage()]
     assert len(downgrade_warnings) == 1
+    # event 정규화: 유일했던 [Major] 가 [Suggestion] 으로 강등됐으니 REQUEST_CHANGES 의
+    # 전제(blocking severity ≥ 1) 가 깨졌다 → COMMENT 로 약화돼야 한다.
+    # 이 assertion 이 빠지면 "강등은 했지만 PR 차단 신호는 그대로" 인 모순 상태가 회귀.
+    assert result.event == ReviewEvent.COMMENT, (
+        "강등으로 blocking severity 가 0이 되면 REQUEST_CHANGES 도 약화돼야 한다"
+    )
+    weaken_warnings = [r for r in caplog.records if "weakening REQUEST_CHANGES" in r.getMessage()]
+    assert len(weaken_warnings) == 1, "약화 사실이 운영 관측 로그로 남아야 한다"
 
 
 def test_parse_does_not_downgrade_legitimate_critical_without_hallucination_marker() -> None:
@@ -259,3 +300,106 @@ def test_parse_does_not_downgrade_minor_or_suggestion() -> None:
     assert result.findings[0].body.startswith("[Minor]")
     assert result.findings[1].body.startswith("[Suggestion]")
     assert all("자동 강등" not in f.body for f in result.findings)
+
+
+# --- Event normalization (REQUEST_CHANGES weakening) -----------------------
+
+
+def test_parse_keeps_request_changes_when_blocking_severity_survives() -> None:
+    """남은 finding 중 [Critical] 이나 [Major] 가 하나라도 있으면 REQUEST_CHANGES 유지.
+
+    회귀 방지: 약화 규칙이 너무 공격적이면 정당한 PR 차단 신호까지 잃는다. blocking
+    severity 가 살아있는 한 모델 의도(REQUEST_CHANGES) 를 그대로 존중해야 한다.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "REQUEST_CHANGES",
+      "comments": [
+        {"path": "a.py", "line": 1, "body": "[Critical] 진짜 버그"},
+        {"path": "b.py", "line": 2, "body": "[Suggestion] 사소한 제안"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.event == ReviewEvent.REQUEST_CHANGES
+    assert len(result.findings) == 2
+
+
+def test_parse_weakens_request_changes_when_path_grounding_drops_blocking(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """path grounding 으로 blocking finding 이 모두 드롭되면 REQUEST_CHANGES → COMMENT.
+
+    실관측 시나리오: 모델이 환각 path 에 [Critical] 을 달고 REQUEST_CHANGES 를 골랐는데
+    우리가 그 finding 을 path grounding 으로 드롭. 그 결과 REQUEST_CHANGES 의 전제가
+    깨졌으므로 약화돼야 한다 — 안 그러면 환각으로 PR 이 차단되는 사고가 남는다.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "REQUEST_CHANGES",
+      "comments": [
+        {"path": "tests/imaginary.py", "line": 1, "body": "[Critical] 가짜 파일에 대한 환각"}
+      ]
+    }
+    """
+    with caplog.at_level(logging.WARNING):
+        result = parse_review(raw, valid_paths=frozenset({"src/real.py"}))
+
+    assert result.findings == ()
+    assert result.event == ReviewEvent.COMMENT, (
+        "환각 path 의 [Critical] 이 드롭됐다면 REQUEST_CHANGES 도 약화돼야 한다"
+    )
+    weaken_warns = [r for r in caplog.records if "weakening REQUEST_CHANGES" in r.getMessage()]
+    assert len(weaken_warns) == 1
+
+
+def test_parse_does_not_strengthen_comment_to_request_changes() -> None:
+    """모델이 COMMENT 를 골랐다면 [Critical] 이 살아있어도 우리가 격상하지 않는다.
+
+    원칙: 정규화는 약화 전용. 모델이 COMMENT 를 고른 데는 우리가 모르는 맥락(예: WIP
+    PR 이라 차단 단계가 아님) 이 있을 수 있어 일방적 격상은 위험. LLM 이 자체적으로
+    "이건 차단해야" 라고 표현한 경우만 차단을 인정.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "COMMENT",
+      "comments": [
+        {"path": "a.py", "line": 1, "body": "[Critical] 강한 지적이지만 모델은 COMMENT 선택"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.event == ReviewEvent.COMMENT, "모델이 고른 COMMENT 는 격상하지 않는다"
+
+
+def test_parse_does_not_touch_approve_event() -> None:
+    """APPROVE 는 우리가 손대지 않는다 — 모델 적극 승인 의사를 필터링이 뒤집지 못함."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "APPROVE",
+      "comments": []
+    }
+    """
+    result = parse_review(raw)
+    assert result.event == ReviewEvent.APPROVE
+
+
+def test_parse_weakens_request_changes_when_no_findings_at_all() -> None:
+    """REQUEST_CHANGES 인데 인라인 코멘트가 0개면 약화 — 이미 일관성이 깨진 상태.
+
+    `comments=[]` 라면 차단할 구체 근거가 없는 셈. 약화하는 것이 본문 surface 와도
+    일관 (본문에는 improvements 가 들어가지만 그건 권고지 차단 사유는 아니다).
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "REQUEST_CHANGES",
+      "comments": []
+    }
+    """
+    result = parse_review(raw)
+    assert result.event == ReviewEvent.COMMENT

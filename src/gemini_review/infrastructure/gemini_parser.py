@@ -34,18 +34,26 @@ _HALLUCINATION_PATTERNS = (
     "@@n",  # 모델이 "@@n 등으로 하드코딩" 같은 식으로 가짜 패턴 인용
     "+xn",  # 동일 카테고리의 가짜 patch 인용
 )
+# Hot path 마이크로 최적화: finding 마다 `p.lower()` 를 다시 부르지 않도록 모듈 로드
+# 시 한 번 소문자로 정규화. 패턴 자체가 ASCII 라 case-folding 차이는 없다.
+_HALLUCINATION_PATTERNS_LOWER = tuple(p.lower() for p in _HALLUCINATION_PATTERNS)
+
+# 등급 → "PR 차단 신호 여부" 매핑. Critical/Major 가 "blocking", Minor/Suggestion 은 권고.
+# `_normalize_event` 가 REQUEST_CHANGES 를 약화할지 판단할 때 참조.
+_BLOCKING_SEVERITIES = frozenset({"Critical", "Major"})
 
 
 def parse_review(
     raw: str,
     *,
-    valid_paths: frozenset[str] = frozenset(),
+    valid_paths: frozenset[str] | None = None,
 ) -> ReviewResult:
     """모델 출력에서 ReviewResult 추출.
 
-    `valid_paths` 가 비어 있지 않으면, 그 집합에 없는 path 를 가진 finding 은 드롭한다
+    `valid_paths` 가 None 이면 path 검증을 생략 (단위 테스트 호환). 명시적으로
+    `frozenset` (빈 집합 포함) 을 주면 그 집합에 없는 path 를 가진 finding 을 드롭한다
     (path grounding — 모델이 PR 에 존재하지 않는 파일을 지적하는 환각 차단). 빈 집합
-    이면 검증을 생략 — 단위 테스트가 path 검증과 무관한 시나리오에서 호출하도록 호환성.
+    의 의미가 "검증 안 함" 과 "전부 드롭" 으로 갈리는 모호함을 None sentinel 로 분리.
     """
     payload = _extract_json(raw)
     if payload is None:
@@ -55,8 +63,12 @@ def parse_review(
             event=ReviewEvent.COMMENT,
         )
 
-    event = _parse_event(payload.get("event"))
+    raw_event = _parse_event(payload.get("event"))
     findings = tuple(_parse_findings(payload.get("comments"), valid_paths=valid_paths))
+    # 등급 강등/path 드롭 이후 남은 finding 의 등급 분포로 event 를 재정합. 모델이
+    # 환각 기반 [Critical] 을 보고 REQUEST_CHANGES 를 골랐는데 우리가 그걸 [Suggestion]
+    # 으로 강등하거나 통째로 드롭했다면, REQUEST_CHANGES 는 더 이상 정당하지 않다.
+    event = _normalize_event(raw_event, findings)
 
     return ReviewResult(
         summary=str(payload.get("summary", "")).strip() or "요약 없음",
@@ -65,6 +77,37 @@ def parse_review(
         improvements=tuple(_as_str_list(payload.get("improvements"))),
         findings=findings,
     )
+
+
+def _normalize_event(event: ReviewEvent, findings: tuple[Finding, ...]) -> ReviewEvent:
+    """필터링/강등 이후 finding 분포로 REQUEST_CHANGES 를 약화 (강화는 안 함).
+
+    원칙: **약화 전용**. 모델이 COMMENT 를 골랐다면 거기엔 모델만 아는 맥락(예: 본문에는
+    Critical 코멘트가 있지만 PR 자체는 WIP 라 차단할 단계가 아님) 이 있을 수 있어 우리가
+    REQUEST_CHANGES 로 끌어올리지 않는다. 반대로 REQUEST_CHANGES 는 "PR 을 막을 수
+    있는 [Critical]/[Major] 가 최소 1개 있다" 가 필수 전제 — 우리 후처리로 그 전제가
+    깨졌다면 이 신호를 그대로 두는 건 잘못이다.
+
+    APPROVE 는 우리가 손대지 않는다 — 모델이 "통과시켜라" 라고 적극 표현한 건 우리
+    필터링과 무관하게 존중. (우리는 승인의 적합성을 판단할 정보가 없다.)
+    """
+    if event != ReviewEvent.REQUEST_CHANGES:
+        return event
+    has_blocking = any(_extract_severity(f.body) in _BLOCKING_SEVERITIES for f in findings)
+    if has_blocking:
+        return event
+    logger.warning(
+        "weakening REQUEST_CHANGES -> COMMENT: no [Critical]/[Major] findings survive "
+        "(filter/downgrade dropped them all). %d findings remain.",
+        len(findings),
+    )
+    return ReviewEvent.COMMENT
+
+
+def _extract_severity(body: str) -> str | None:
+    """body 가 `[등급]` 접두사로 시작하면 그 등급 문자열을 반환, 아니면 None."""
+    m = _SEVERITY_PREFIX.match(body)
+    return m.group(1) if m else None
 
 
 def _extract_json(text: str) -> dict[str, object] | None:
@@ -113,7 +156,7 @@ def _parse_event(value: object) -> ReviewEvent:
 def _parse_findings(
     raw: object,
     *,
-    valid_paths: frozenset[str] = frozenset(),
+    valid_paths: frozenset[str] | None = None,
 ) -> list[Finding]:
     if not isinstance(raw, list):
         return []
@@ -130,8 +173,10 @@ def _parse_findings(
             continue
         # Path grounding — PR 변경 파일 목록에 없는 path 는 모델 환각으로 간주하고 드롭.
         # 사용자 보고 사례 2 (`tests/unit/test_github_app_client.py` 같은 fictional path)
-        # 의 직접적 차단. valid_paths 가 비어 있는 호출(테스트 호환) 에선 검증 안 함.
-        if valid_paths and path not in valid_paths:
+        # 의 직접적 차단. valid_paths=None 이면 검증 생략 (단위 테스트 호환).
+        # 빈 frozenset 을 명시적으로 주면 "PR 에 변경 파일이 0개" 로 간주해 모든 finding
+        # 을 드롭한다 — 모호함 분리가 None sentinel 의 핵심.
+        if valid_paths is not None and path not in valid_paths:
             logger.warning(
                 "dropping finding on non-changed path (likely hallucination): "
                 "path=%s line=%d body=%r",
@@ -160,10 +205,21 @@ def _maybe_downgrade_severity(path: str, line: int, body: str) -> str:
     if head is None:
         return body
     severity, rest = head.group(1), head.group(2)
-    if severity not in ("Critical", "Major"):
+    if severity not in _BLOCKING_SEVERITIES:
         return body
     lower = body.lower()
-    matched = next((p for p in _HALLUCINATION_PATTERNS if p.lower() in lower), None)
+    # `_HALLUCINATION_PATTERNS_LOWER` 는 모듈 로드 시 한 번만 정규화해 두는 사본이라
+    # finding 마다 매 패턴을 lower() 호출하지 않는다. zip 으로 원형도 함께 받아 로그에 노출.
+    matched = next(
+        (
+            original
+            for original, lowered in zip(
+                _HALLUCINATION_PATTERNS, _HALLUCINATION_PATTERNS_LOWER, strict=True
+            )
+            if lowered in lower
+        ),
+        None,
+    )
     if matched is None:
         return body
     logger.warning(
