@@ -169,3 +169,28 @@ def test_prompt_schema_shows_grade_prefix_for_comment_body() -> None:
         "등급 섹션에서 Critical 이후에 REQUEST_CHANGES 가 등장해야 한다 — "
         "두 키워드가 '연결된 규칙' 으로 서술돼야 모델이 맥락을 읽는다"
     )
+
+
+def test_prompt_warns_against_escape_sequence_hallucination() -> None:
+    """소스 코드의 `\\n` 등 escape 시퀀스를 literal `n` 으로 오해하는 환각 패턴을 명시적으로 차단.
+
+    실관측 회귀: codex-pr-review-py#17 에서 gemini 봇이 테스트 코드의 `\\n` 을 literal `n`
+    으로 오해해 [Major] 등급의 잘못된 지적을 게시. 우리 직렬화는 라인 내용을 있는 그대로
+    프롬프트에 노출하므로(escape 시퀀스도 두 글자로), 모델이 소스 표기와 런타임 동작을
+    혼동하면 false positive 차단으로 이어짐. 이 테스트는 환각 방지 섹션이 누락되거나
+    핵심 anti-pattern 예시가 빠지는 회귀를 잡는다.
+    """
+    dump = FileDump(entries=(), total_chars=0)
+    prompt = build_prompt(_pr(), dump)
+
+    # 섹션 헤더 자체
+    assert "## 흔한 환각 방지" in prompt
+
+    # 환각의 구체 패턴이 anti-pattern 으로 명시돼 있어야 모델이 학습
+    # (`\n` 이 literal `n` 으로 처리된다는 잘못된 해석 예시)
+    assert "newline 이 아니라 literal" in prompt or "literal 문자 `n`" in prompt
+    # raw string / 이중 escape 등 올바른 해석 분기도 있어야 한다
+    assert "raw string" in prompt
+    assert "이중 escape" in prompt or "\\\\n" in prompt
+    # 자신 없으면 생략하라는 지침 — 환각 false positive 의 직접 차단
+    assert "확인할 수 없는 주장은 하지 말" in prompt or "자신이 없으면" in prompt
