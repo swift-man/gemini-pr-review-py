@@ -607,6 +607,56 @@ def test_fetch_pull_request_rechecks_head_sha_after_files(
     assert pr.head_sha == "abc"
 
 
+def test_fetch_pull_request_uses_recheck_metadata_when_head_sha_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """head_sha 동일하면 더 신선한 `recheck` 응답의 메타데이터(title/body/draft)를 채택.
+
+    회귀 방지 (gemini PR #19 review #2): fetch 도중 사용자가 head 는 안 바꾸고 PR 본문/
+    제목/draft 상태만 갱신하는 경우, `pr_data` 기준으로 PullRequest 를 만들면 옛 메타가
+    박힌다. head_sha 가 같다는 것은 changed/addable 일관성만 보장하면 되고, 메타는 더
+    신선한 쪽을 쓰는 게 자연스럽다.
+    """
+    pulls_call_count = 0
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        nonlocal pulls_call_count
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        if "/files" in req.full_url:
+            return _FakeResponse(
+                b'[{"filename": "src/a.py", "patch": "@@ -1,0 +5,2 @@\\n+x\\n+y\\n"}]'
+            )
+        # /pulls/{n}: 첫 호출 = 옛 메타, 두 번째 호출 = 새 메타 (head_sha 동일).
+        pulls_call_count += 1
+        is_initial = pulls_call_count == 1
+        return _FakeResponse(json.dumps({
+            "title": "옛 제목" if is_initial else "새 제목",
+            "body": "옛 본문" if is_initial else "새 본문",
+            "draft": True if is_initial else False,
+            "head": {"sha": "abc", "ref": "feat", "repo": {"clone_url": "https://x.git"}},
+            "base": {"sha": "def", "ref": "main"},
+        }).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # head_sha 동일성은 유지
+    assert pr.head_sha == "abc"
+    # 메타데이터는 두 번째(recheck) 응답 기준 — 옛 메타가 박히면 회귀
+    assert pr.title == "새 제목"
+    assert pr.body == "새 본문"
+    assert pr.is_draft is False
+
+
 def test_fetch_pull_request_retries_when_head_sha_changes_mid_fetch(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

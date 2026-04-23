@@ -120,13 +120,17 @@ class GitHubAppClient:
             recheck = self._request_object("GET", pr_url, auth=f"token {token}")
             rechecked_sha = str(recheck["head"]["sha"])
             if rechecked_sha == initial_sha:
-                head = pr_data["head"]
-                base = pr_data["base"]
+                # head_sha 가 동일함이 보장됐으므로 changed/addable 는 어느 응답 기준이든
+                # 일관됨. 메타데이터(title/body/draft) 는 더 신선한 `recheck` 기준으로
+                # 채택해 fetch 도중 변동된 사소한 메타도 누락 없이 반영 (gemini PR #19
+                # review #2). head_sha 는 동일하므로 안전.
+                head = recheck["head"]
+                base = recheck["base"]
                 return PullRequest(
                     repo=repo,
                     number=number,
-                    title=str(pr_data.get("title", "")),
-                    body=str(pr_data.get("body") or ""),
+                    title=str(recheck.get("title", "")),
+                    body=str(recheck.get("body") or ""),
                     head_sha=str(head["sha"]),
                     head_ref=str(head["ref"]),
                     base_sha=str(base["sha"]),
@@ -134,7 +138,7 @@ class GitHubAppClient:
                     clone_url=str(head["repo"]["clone_url"]),
                     changed_files=tuple(changed),
                     installation_id=installation_id,
-                    is_draft=bool(pr_data.get("draft", False)),
+                    is_draft=bool(recheck.get("draft", False)),
                     addable_lines=tuple(addable),
                 )
 
