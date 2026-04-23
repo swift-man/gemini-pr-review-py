@@ -35,8 +35,9 @@ _HALLUCINATION_PATTERNS = (
     "+xn",  # 동일 카테고리의 가짜 patch 인용
 )
 # Hot path 마이크로 최적화: finding 마다 `p.lower()` 를 다시 부르지 않도록 모듈 로드
-# 시 한 번 소문자로 정규화. 패턴 자체가 ASCII 라 case-folding 차이는 없다.
-_HALLUCINATION_PATTERNS_LOWER = tuple(p.lower() for p in _HALLUCINATION_PATTERNS)
+# 시 한 번 (원형, 소문자) 쌍으로 미리 묶어 둔다. 매 호출마다 zip 을 다시 돌리는 비용도
+# 같이 제거 (gemini PR #20 review #2). 패턴 자체가 ASCII 라 case-folding 차이는 없다.
+_HALLUCINATION_PATTERN_PAIRS = tuple((p, p.lower()) for p in _HALLUCINATION_PATTERNS)
 
 # 등급 → "PR 차단 신호 여부" 매핑. Critical/Major 가 "blocking", Minor/Suggestion 은 권고.
 # `_normalize_event` 가 REQUEST_CHANGES 를 약화할지 판단할 때 참조.
@@ -65,52 +66,61 @@ def parse_review(
 
     raw_event = _parse_event(payload.get("event"))
     findings = tuple(_parse_findings(payload.get("comments"), valid_paths=valid_paths))
-    # 등급 강등/path 드롭 이후 남은 finding 의 등급 분포로 event 를 재정합. 모델이
+    improvements = tuple(_as_str_list(payload.get("improvements")))
+    # 등급 강등/path 드롭 이후 남은 finding + improvements 분포로 event 재정합. 모델이
     # 환각 기반 [Critical] 을 보고 REQUEST_CHANGES 를 골랐는데 우리가 그걸 [Suggestion]
-    # 으로 강등하거나 통째로 드롭했다면, REQUEST_CHANGES 는 더 이상 정당하지 않다.
-    event = _normalize_event(raw_event, findings)
+    # 으로 강등하거나 통째로 드롭했고, 본문 차단 근거(`improvements`) 도 비어 있다면,
+    # REQUEST_CHANGES 는 더 이상 정당하지 않다.
+    event = _normalize_event(raw_event, findings, improvements)
 
     return ReviewResult(
         summary=str(payload.get("summary", "")).strip() or "요약 없음",
         event=event,
         positives=tuple(_as_str_list(payload.get("positives"))),
-        improvements=tuple(_as_str_list(payload.get("improvements"))),
+        improvements=improvements,
         findings=findings,
     )
 
 
-def _normalize_event(event: ReviewEvent, findings: tuple[Finding, ...]) -> ReviewEvent:
-    """필터링/강등 이후 finding 분포로 REQUEST_CHANGES 를 약화 (강화는 안 함).
+def _normalize_event(
+    event: ReviewEvent,
+    findings: tuple[Finding, ...],
+    improvements: tuple[str, ...],
+) -> ReviewEvent:
+    """필터링/강등 이후 finding/improvements 분포로 REQUEST_CHANGES 를 약화 (강화는 안 함).
 
     원칙: **약화 전용**. 모델이 COMMENT 를 골랐다면 거기엔 모델만 아는 맥락(예: 본문에는
     Critical 코멘트가 있지만 PR 자체는 WIP 라 차단할 단계가 아님) 이 있을 수 있어 우리가
     REQUEST_CHANGES 로 끌어올리지 않는다. 반대로 REQUEST_CHANGES 는 "PR 을 막을 수
-    있는 [Critical]/[Major] 가 최소 1개 있다" 가 필수 전제 — 우리 후처리로 그 전제가
-    깨졌다면 이 신호를 그대로 두는 건 잘못이다.
+    있는 차단 신호가 최소 1개 있다" 가 필수 전제 — 우리 후처리로 그 전제가 모두
+    파괴됐다면 이 신호를 그대로 두는 건 잘못이다.
 
     APPROVE 는 우리가 손대지 않는다 — 모델이 "통과시켜라" 라고 적극 표현한 건 우리
     필터링과 무관하게 존중. (우리는 승인의 적합성을 판단할 정보가 없다.)
 
-    ### 태그 누락 finding 에 대한 보수적 처리
+    ### 차단 신호 보존 규칙 (보수적 우선)
 
-    파서는 본문 앞에 `[등급]` 접두사가 없는 finding 도 드롭하지 않고 WARN 만 찍은 채
-    게시한다 (운영 관측 후 정책 강화). 따라서 "등급 태그 없음 = 비차단" 이라는
-    단순 해석은 위험하다: 모델이 REQUEST_CHANGES 를 내며 본문에 "여기서 데이터 손실
-    난다" 라고 썼는데 `[Critical]` 태그만 빠졌다면, 우리가 COMMENT 로 약화하면서
-    차단 신호를 지우는 false negative 가 생긴다. 그래서 **태그 누락 finding 이 하나
-    라도 있으면 약화를 보류**한다 — 모델 의도를 더 우선한다.
+    아래 중 하나라도 만족하면 **약화 보류** — 모델 REQUEST_CHANGES 의도를 존중:
 
-    약화가 발동하는 유일한 조건: 모든 finding 이 `[등급]` 태그를 갖고 있고, 그 중
-    `[Critical]`/`[Major]` 가 0개. (태그가 다 있는 깨끗한 상태에서만 확실히 판단.)
+    1. **finding 에 `[Critical]`/`[Major]` 가 살아 있음** — 인라인 차단 사유 명확히 존재.
+    2. **태그 누락 finding 이 있음** — 본문 앞 `[등급]` 접두사 누락은 파서 정책상
+       드롭하지 않고 게시 (WARN 만). "태그 없음 = 비차단" 으로 단순 해석하면 모델이
+       태그만 깜빡한 차단급 본문을 약화로 지워버리는 false negative 발생 (codex #20).
+    3. **improvements 가 비어 있지 않음** — 라인에 고정할 수 없는 모듈/설계 단위 차단
+       사유 (예: "이 흐름은 데이터 손실 위험") 가 본문 섹션에 남아 있을 수 있다. 우리는
+       improvements 를 필터링하지 않으므로 모델이 적은 차단 근거가 본문에 살아 있는 셈
+       (codex #20 #2). 보수적으로 약화 보류.
+
+    약화 발동 조건: REQUEST_CHANGES + 위 세 가지가 모두 거짓. 즉 모델이 차단을 외쳤지만
+    우리가 후처리로 그 근거를 모조리 지운 깨끗한 상태에서만 약화한다.
     """
     if event != ReviewEvent.REQUEST_CHANGES:
         return event
     severities = [_extract_severity(f.body) for f in findings]
-    has_blocking = any(sev in _BLOCKING_SEVERITIES for sev in severities)
-    if has_blocking:
+    if any(sev in _BLOCKING_SEVERITIES for sev in severities):
         return event
     # 태그 누락 finding 이 있으면 보수적으로 유지. 본문에 차단 사유가 숨어 있을 수 있음.
-    missing_tag_count = sum(1 for sev in severities if sev is None)
+    missing_tag_count = severities.count(None)
     if missing_tag_count > 0:
         logger.warning(
             "keeping REQUEST_CHANGES despite no tagged blocking finding: "
@@ -118,9 +128,18 @@ def _normalize_event(event: ReviewEvent, findings: tuple[Finding, ...]) -> Revie
             missing_tag_count,
         )
         return event
+    # improvements 에 모델이 적은 본문 차단 근거가 남아 있으면 약화 보류 (codex #20 #2).
+    # 라인 고정 불가능한 모듈/설계 단위 차단 이슈는 inline finding 으로 표현될 수 없다.
+    if improvements:
+        logger.warning(
+            "keeping REQUEST_CHANGES despite no blocking finding: "
+            "%d improvement entries remain in body and may carry blocking rationale",
+            len(improvements),
+        )
+        return event
     logger.warning(
         "weakening REQUEST_CHANGES -> COMMENT: no [Critical]/[Major] findings survive "
-        "(filter/downgrade dropped them all). %d findings remain.",
+        "and improvements is empty (no blocking signal anywhere). %d findings remain.",
         len(findings),
     )
     return ReviewEvent.COMMENT
@@ -230,16 +249,10 @@ def _maybe_downgrade_severity(path: str, line: int, body: str) -> str:
     if severity not in _BLOCKING_SEVERITIES:
         return body
     lower = body.lower()
-    # `_HALLUCINATION_PATTERNS_LOWER` 는 모듈 로드 시 한 번만 정규화해 두는 사본이라
-    # finding 마다 매 패턴을 lower() 호출하지 않는다. zip 으로 원형도 함께 받아 로그에 노출.
+    # `_HALLUCINATION_PATTERN_PAIRS` 는 모듈 로드 시 (원형, 소문자) 쌍으로 미리 묶여 있어
+    # finding 마다 매 패턴 lower() 호출과 zip() 재실행 비용을 모두 제거.
     matched = next(
-        (
-            original
-            for original, lowered in zip(
-                _HALLUCINATION_PATTERNS, _HALLUCINATION_PATTERNS_LOWER, strict=True
-            )
-            if lowered in lower
-        ),
+        (original for original, lowered in _HALLUCINATION_PATTERN_PAIRS if lowered in lower),
         None,
     )
     if matched is None:

@@ -388,21 +388,63 @@ def test_parse_does_not_touch_approve_event() -> None:
     assert result.event == ReviewEvent.APPROVE
 
 
-def test_parse_weakens_request_changes_when_no_findings_at_all() -> None:
-    """REQUEST_CHANGES 인데 인라인 코멘트가 0개면 약화 — 이미 일관성이 깨진 상태.
+def test_parse_weakens_request_changes_when_no_findings_and_no_improvements() -> None:
+    """REQUEST_CHANGES 인데 인라인 0건 + improvements 0건 = 차단 신호 어디에도 없음.
 
-    `comments=[]` 라면 차단할 구체 근거가 없는 셈. 약화하는 것이 본문 surface 와도
-    일관 (본문에는 improvements 가 들어가지만 그건 권고지 차단 사유는 아니다).
+    이 케이스만 약화 정당. 모델이 차단을 외쳤지만 본문/인라인 어디에도 그 근거가
+    없다 — 약화해서 자연스러운 상태로 만든다.
     """
     raw = """
     {
       "summary": "ok",
       "event": "REQUEST_CHANGES",
-      "comments": []
+      "comments": [],
+      "improvements": []
     }
     """
     result = parse_review(raw)
     assert result.event == ReviewEvent.COMMENT
+
+
+def test_parse_keeps_request_changes_when_improvements_carry_blocking_rationale(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """improvements 비어있지 않으면 약화 보류 — codex #20 후속 회귀 방지.
+
+    실관측 시나리오: 라인 고정 불가능한 모듈/설계 단위 차단 사유 (예: "이 흐름은
+    중복 처리 + 데이터 손실 위험" 같이 코드 한 줄에 안 묶이는 것) 를 모델이
+    `improvements` 에 적고 `REQUEST_CHANGES` 선택. 인라인 finding 은 0개일 수 있다.
+
+    이 때 우리가 `comments=[]` 만 보고 약화하면 본문 차단 근거를 무시하고 차단 신호를
+    지운다. improvements 가 비어있지 않은 한 약화 보류 — 모델이 본문에 적은 차단 사유를
+    존중한다 (필터링 대상도 아님).
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "REQUEST_CHANGES",
+      "comments": [],
+      "improvements": [
+        "이 모듈은 동시성 진입점이 두 군데로 갈려 있어 데이터 손실 위험이 있다"
+      ]
+    }
+    """
+    with caplog.at_level(logging.WARNING):
+        result = parse_review(raw)
+
+    assert result.event == ReviewEvent.REQUEST_CHANGES, (
+        "improvements 에 본문 차단 근거가 있으면 약화 보류해야 한다"
+    )
+    assert result.improvements == (
+        "이 모듈은 동시성 진입점이 두 군데로 갈려 있어 데이터 손실 위험이 있다",
+    )
+    keep_warns = [
+        r for r in caplog.records
+        if "improvement entries remain in body" in r.getMessage()
+    ]
+    assert len(keep_warns) == 1, "improvements 보존 사실이 운영 로그로 남아야 한다"
+
+
 
 
 def test_parse_keeps_request_changes_when_untagged_finding_hides_blocking_intent(
@@ -442,11 +484,13 @@ def test_parse_keeps_request_changes_when_untagged_finding_hides_blocking_intent
 
 
 def test_parse_weakens_only_when_all_findings_tagged_and_none_blocking() -> None:
-    """태그가 **전부** 있고 그 중 blocking 이 0개일 때만 약화 발동.
+    """태그가 **전부** 있고 blocking 0개 + improvements 비어있음 — 모든 보류 규칙 통과.
 
-    회귀 방지: 태그 있는 Minor/Suggestion 만 남은 순수한 "비차단" 상태에선 약화가 정상
-    발동해야 한다. 태그 누락 보류 규칙이 너무 광범위하게 적용돼 약화 자체가 무력화
-    되는 것을 막는다.
+    회귀 방지: 태그 있는 Minor/Suggestion 만 남고 본문 근거도 0건인 순수 "비차단"
+    상태에선 약화가 정상 발동해야 한다. 태그 누락 보류 규칙 또는 improvements 보류
+    규칙이 너무 광범위하게 적용돼 약화 자체가 무력화되는 것을 막는다.
+
+    `improvements` 키가 없으면 빈 tuple 로 파싱되므로 약화 발동 (codex #20 #2).
     """
     raw = """
     {
@@ -460,5 +504,5 @@ def test_parse_weakens_only_when_all_findings_tagged_and_none_blocking() -> None
     """
     result = parse_review(raw)
     assert result.event == ReviewEvent.COMMENT, (
-        "태그 다 있고 blocking 0개면 약화 발동"
+        "태그 다 있고 blocking 0개 + improvements 0건이면 약화 발동"
     )
