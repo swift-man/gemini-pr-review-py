@@ -131,12 +131,16 @@ class GitHubAppClient:
         # 재사용한다. 이렇게 하면 N 회 시도 시 `/pulls` 호출이 2N 회가 아니라 N+1 회로
         # 줄어든다 (gemini PR #19 review #1).
         pr_data: dict[str, Any] | None = None
-        # 마지막 시도에서 발생한 mid-pagination 예외 — 모든 시도 실패 후 RuntimeError 의
-        # cause 로 전파해 운영자가 "ABA 페이지 race" vs "fetch 시작-끝 SHA 변경" 을
-        # 구분할 수 있게 한다 (codex PR #19 review #4). 두 실패 모드는 디버깅 액션이
-        # 다르므로 같은 메시지로 묶이면 잘못된 진단을 유도.
+        # **마지막 시도** 의 실패 모드를 RuntimeError 메시지/cause 에 반영해 운영자가
+        # "ABA 페이지 race" vs "fetch 시작-끝 SHA 변경" 을 구분할 수 있게 한다
+        # (codex PR #19 review #4). 두 실패 모드는 디버깅 액션이 다름.
+        #
+        # 시도마다 reset 해야 — 이전 시도가 mid-pagination 으로 끝나고 마지막 시도가
+        # start/end 로 끝났는데도 옛 mid-pagination 예외가 남아 잘못된 모드로 보고되는
+        # 회귀를 막는다 (codex PR #19 review #6). 매 iteration 시작에서 None 으로 초기화.
         last_mid_pagination_exc: _HeadShaChangedMidFetch | None = None
         for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+            last_mid_pagination_exc = None  # 시도 시작마다 초기화 — 이전 시도의 모드가 새 시도에 안 새도록
             if pr_data is None:
                 pr_data = self._request_object("GET", pr_url, auth=f"token {token}")
             initial_sha = str(pr_data["head"]["sha"])
@@ -243,17 +247,24 @@ class GitHubAppClient:
           2) 각 파일의 patch → addable_lines 사전 파싱 (post_review 인라인 분할용)
         per_page=100 은 GitHub 허용 최대치라 PR 이 큰 경우의 라운드트립 수를 최소화.
 
-        ### ABA race 방어 (codex PR #19 review #3)
+        ### ABA race 방어 (codex PR #19 review #3 → #5 보강)
 
         멀티 페이지 PR 에서 페이지 1 은 SHA A 기준, 페이지 2 는 SHA B 기준 patch 로
         받았더라도 마지막 recheck 시점이 다시 A 라면 바깥 비교는 통과하고 서로 다른
-        페이지가 혼합된 스냅샷이 PullRequest 에 박힌다. 이를 막으려면 페이지 사이에도
-        head_sha 를 확인해야 한다.
+        페이지가 혼합된 스냅샷이 PullRequest 에 박힌다.
 
-        여기서는 **다음 페이지를 요청하기 전** 에 `/pulls/{n}` 을 한 번 더 짚어
-        `initial_sha` 와 동일한지 검증한다. 달라져 있으면 `_HeadShaChangedMidFetch` 를
-        올려 바깥 `fetch_pull_request` 루프가 전체 fetch 를 재시도하도록 한다. 단일
-        페이지 PR (`len(files) < 100`) 에서는 추가 호출이 0회라 정상 비용 영향 없음.
+        검증 위치는 **각 페이지 응답 직후, 누적 전** (페이지 2+) 으로 잡는다 — 누적된
+        데이터가 항상 `initial_sha` 기준임을 보장. 이전 구현은 "다음 페이지 요청 직전"
+        에만 검증했는데, 그러면 검증 직후 push 가 발생해 다음 페이지를 다른 SHA 기준으로
+        받아오는 창이 남았다 (codex PR #19 review #5).
+
+        페이지 1 은 `initial_sha` 직후라 race window 가 매우 짧아 별도 검증 생략 — 이미
+        `fetch_pull_request` 의 "fetch 시작-끝 SHA" 비교가 그 창을 cover. 단일 페이지 PR
+        에선 페이지 2 자체가 없으니 추가 호출 0회라 정상 비용 영향 없음.
+
+        호출 비용 비교 (변경 위치만 다르고 횟수는 동일):
+          - 1 페이지 PR: initial(1) + page1(1) + final recheck(1) = 3
+          - N 페이지 PR: initial(1) + N pages + (N-1) post-page checks + final(1) = 2N+1
         """
         files_url = f"{pr_url}/files?per_page=100"
         changed: list[str] = []
@@ -261,6 +272,15 @@ class GitHubAppClient:
         page = 1
         while True:
             files = self._request_list("GET", f"{files_url}&page={page}", auth=f"token {token}")
+            # 페이지 응답 직후, 누적 전에 head_sha 검증. 페이지 1 은 initial_sha 가
+            # 직전에 잡혔으므로 race window 가 매우 좁아 검증 생략 (바깥 final recheck 로
+            # 충분). 페이지 2+ 는 무조건 검증 — 누적 후 검증하면 stale 데이터가 결과에
+            # 섞여도 같은 raise 로 끝나지만 구조 명확성을 위해 누적 전 검증을 고수.
+            if page > 1:
+                check = self._request_object("GET", pr_url, auth=f"token {token}")
+                current_sha = str(check["head"]["sha"])
+                if current_sha != initial_sha:
+                    raise _HeadShaChangedMidFetch(initial_sha, current_sha)
             if not files:
                 break
             for file_entry in files:
@@ -279,11 +299,6 @@ class GitHubAppClient:
             # 100개 미만이면 마지막 페이지 — Link 헤더 대신 길이로 단순 판정.
             if len(files) < 100:
                 break
-            # 다음 페이지 요청 직전 head_sha 재확인. 페이지 사이 race 를 여기서 잡는다.
-            check = self._request_object("GET", pr_url, auth=f"token {token}")
-            current_sha = str(check["head"]["sha"])
-            if current_sha != initial_sha:
-                raise _HeadShaChangedMidFetch(initial_sha, current_sha)
             page += 1
         return changed, addable
 

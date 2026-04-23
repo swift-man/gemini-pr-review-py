@@ -791,10 +791,10 @@ def test_fetch_pull_request_chains_mid_pagination_cause_when_exhausted(
 
     시나리오: ABA 시퀀스를 반복해 모든 시도가 mid-pagination 에서 실패하도록 구성.
     """
-    # 매 시도가 page=1 받고 between-page 체크에서 다른 SHA 발견 → ABA 발생.
-    # 시도 1: pulls=A, page=1, pulls=B (mismatch)
-    # 시도 2: pulls=B, page=1, pulls=C (mismatch)
-    # 시도 3: pulls=C, page=1, pulls=D (mismatch) → exhausted
+    # 매 시도가 page=1 받고 post-page 체크에서 다른 SHA 발견 → ABA 발생.
+    # 시도 1: pulls=A (initial), files1, files2, pulls=B (post-page) → mismatch → raise
+    # 시도 2: pulls=B (initial), files1, files2, pulls=C (post-page) → mismatch → raise
+    # 시도 3: pulls=C (initial), files1, files2, pulls=D (post-page) → mismatch → exhausted
     fake, _counters = _build_fake_urlopen_paginated_aba(
         sha_sequence=["A", "B", "B", "C", "C", "D", "D", "E"]
     )
@@ -814,6 +814,94 @@ def test_fetch_pull_request_chains_mid_pagination_cause_when_exhausted(
     cause = exc_info.value.__cause__
     assert cause is not None
     assert "mid-pagination" in str(cause)
+
+
+def test_fetch_pull_request_reports_start_end_mode_when_last_failure_is_start_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """마지막 시도가 start/end 모드로 끝났는데 이전 시도의 mid-pagination 예외가 남아
+    잘못 보고되는 회귀 방지 (codex PR #19 review #6).
+
+    `last_mid_pagination_exc` 변수가 시도 간에 리셋되지 않으면, 시도 1 이 mid-pagination
+    으로 실패한 뒤 시도 3 이 start/end mismatch 로 실패해도 옛 mid-pagination 예외가
+    남아 있어 exhaustion 메시지가 잘못된 모드를 가리킨다. 시도 시작 시 None 으로 초기화
+    해야 한다.
+
+    시나리오:
+      - 시도 1 (멀티 페이지): pulls=A, files1, files2, pulls=B (post-page ABA raise)
+        → last_mid_pagination_exc 에 시도 1 의 예외 기록
+      - 시도 2 (단일 페이지): pulls=B, files1 (50개, 조기 종료), pulls=C (recheck start/end)
+        → mid-pagination 예외는 발생 안 함. 만약 리셋 안 되면 옛 시도 1 예외가 남음.
+      - 시도 3 (단일 페이지): pulls=C, files1 (50개), pulls=D (recheck) → start/end 실패
+        → exhausted. 메시지는 start/end 모드여야.
+    """
+    # 시도 1 은 multi-page ABA, 시도 2+3 은 single-page start/end mismatch.
+    # 이 fake urlopen 은 attempt 1 에서 page=1 100개, page=2 50개 (multi-page).
+    # 시도 2+3 에서도 같은 응답이 나옴 → 모든 시도가 multi-page 가 됨.
+    # 이 테스트를 정확히 세우려면 attempt 1 만 multi-page, 2+3 은 single-page 로 흘러야.
+    # 복잡한 시뮬이라 별도 fake 가 필요.
+    counters: dict[str, int] = {"pulls": 0, "attempt_calls": 0}
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        if "/files" in req.full_url:
+            # 시도 1 에서만 100개 반환 (multi-page), 이후는 50개 (single page 조기 종료).
+            # `&page=1` 인 경우만 multi-page 로 만듦. `&page=2` 는 50개.
+            if "&page=1" in req.full_url:
+                counters["attempt_calls"] += 1
+                # 시도 1 의 page=1 에서만 100개 → ABA 가 다음에 발동.
+                # 시도 2, 3 의 page=1 은 50개 → 조기 종료 → single-page 경로.
+                if counters["attempt_calls"] == 1:
+                    items = [{"filename": f"p1_{i}.py", "patch": "@@ -1 +1 @@\n+x\n"} for i in range(100)]
+                else:
+                    items = [{"filename": f"sp_{i}.py", "patch": "@@ -1 +1 @@\n+y\n"} for i in range(50)]
+                return _FakeResponse(json.dumps(items).encode())
+            if "&page=2" in req.full_url:
+                items = [{"filename": f"p2_{i}.py", "patch": "@@ -1 +1 @@\n+z\n"} for i in range(50)]
+                return _FakeResponse(json.dumps(items).encode())
+            return _FakeResponse(b'[]')
+        # /pulls — 시도별로 다른 SHA 반환
+        # 시도 1: [0]=A (initial), [1]=B (post-page) → mid-pagination raise
+        #   → pr_data = None (ABA 경로), last_mid_pagination_exc 에 저장
+        # 시도 2: [2]=B (initial 새로), [3]=C (final recheck, mismatch) → start/end raise
+        #   → pr_data = C (carry), last_mid_pagination_exc 는 리셋돼야 함 (이 시도는 ABA 아님)
+        # 시도 3: pr_data 가 C (carry), initial_sha=C, [4]=D (final recheck, mismatch)
+        #   → start/end raise, exhausted. 마지막 모드는 start/end.
+        # 시퀀스에서 [4] 를 D 로 둬서 시도 3 도 반드시 실패시킴.
+        shas = ["A", "B", "B", "C", "D"]
+        idx = min(counters["pulls"], len(shas) - 1)
+        sha = shas[idx]
+        counters["pulls"] += 1
+        return _FakeResponse(json.dumps({
+            "title": "t", "body": "b", "draft": False,
+            "head": {"sha": sha, "ref": "feat", "repo": {"clone_url": "https://x.git"}},
+            "base": {"sha": "base", "ref": "main"},
+        }).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    with pytest.raises(RuntimeError, match="head_sha kept changing") as exc_info:
+        client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # 마지막 시도는 start/end mode 로 실패 — 메시지가 그 모드여야
+    msg = str(exc_info.value)
+    assert "fetch start/end SHA mismatch" in msg, (
+        f"마지막 실패 모드는 start/end 인데 '{msg}' 는 잘못된 모드로 보고함 — "
+        "시도 간 last_mid_pagination_exc 가 리셋되지 않아 옛 예외가 남은 회귀"
+    )
+    assert "mid-pagination" not in msg, (
+        "이전 시도의 mid-pagination 예외가 마지막 모드 진단에 누수되면 안 된다"
+    )
+    # cause chain 도 없어야 — 마지막 실패가 start/end 라 mid-pagination 예외를 chain 할 이유 없음
+    assert exc_info.value.__cause__ is None
 
 
 def _build_fake_urlopen_paginated_aba(
