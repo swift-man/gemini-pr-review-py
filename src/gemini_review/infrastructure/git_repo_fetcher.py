@@ -135,7 +135,12 @@ def _run(cmd: list[str], *, check: bool = True) -> None:
     logger.debug("git %s", masked)
     result = subprocess.run(cmd, capture_output=True, text=True)  # noqa: S603
     if check and result.returncode != 0:
+        # `git` 인증 실패 시 stderr 가 토큰 박힌 원격 URL 을 그대로 출력할 수 있다 — 예외
+        # 메시지가 그대로 로깅되면 설치 토큰이 다시 새는 경로가 된다 (codex PR #21 review
+        # #6 [Major]). DEBUG 로그 마스킹과 동일한 규칙을 stderr 에도 적용해 토큰 노출을
+        # 양쪽 다 차단.
+        masked_stderr = _AUTH_URL_CREDS.sub(r"\1***:***@", result.stderr.strip())
         raise RuntimeError(
             f"git command failed ({result.returncode}): {' '.join(cmd[:2])}...\n"
-            f"{result.stderr.strip()}"
+            f"{masked_stderr}"
         )

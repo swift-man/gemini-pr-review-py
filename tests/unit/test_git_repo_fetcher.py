@@ -395,3 +395,51 @@ def test_checkout_does_not_log_installation_token_in_debug(
     assert "***:***@" in all_log_text, (
         "마스킹 패턴이 로그에 보여야 — 아예 URL 인자를 안 찍었으면 디버깅 가치 상실"
     )
+
+
+def test_run_failure_masks_token_in_stderr_exception_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`git` 실패 시 stderr 가 토큰을 포함해 출력해도 예외 메시지로 토큰이 새지 않는다.
+
+    회귀 방지 (codex PR #21 review #6 [Major]): `git fetch` 등이 인증 실패 시 stderr 에
+    토큰 박힌 원격 URL 을 그대로 찍는다. `_run` 이 그 stderr 를 RuntimeError 메시지로 그대로
+    감싸면 (예전 동작) 예외 로깅 경로로 토큰이 다시 새는 셈. DEBUG 로그 마스킹과 같은 규칙을
+    stderr 에도 적용해 양쪽 다 차단해야 한다.
+    """
+    repo_path = tmp_path / "o" / "r"
+    (repo_path / ".git").mkdir(parents=True)
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        # fetch 호출에서 실패. stderr 에 토큰 박힌 URL 포함 — 실 git 의 인증 실패 메시지 모사.
+        if "fetch" in cmd:
+            return subprocess.CompletedProcess(
+                cmd,
+                returncode=128,
+                stdout="",
+                stderr=(
+                    "fatal: unable to access "
+                    "'https://x-access-token:ghs_SECRETTOKEN123@github.com/o/r.git/': "
+                    "The requested URL returned error: 401"
+                ),
+            )
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    fetcher = GitRepoFetcher(cache_dir=tmp_path)
+
+    with pytest.raises(RuntimeError, match="git command failed") as exc_info:
+        fetcher.checkout(_make_pr(), installation_token="ghs_SECRETTOKEN123")
+
+    msg = str(exc_info.value)
+    # stderr 에 박혔던 토큰이 예외 메시지에서 사라져야
+    assert "ghs_SECRETTOKEN123" not in msg, (
+        "git stderr 의 토큰이 RuntimeError 메시지로 새면 안 됨 — 예외 로그로 자격 증명 유출"
+    )
+    # 마스킹 패턴이 들어가 있어야 (실제로 stderr 가 마스킹 처리된 흔적)
+    assert "***:***@github.com/o/r.git" in msg, (
+        "마스킹 패턴이 메시지에 보여야 — stderr 가 통째로 사라지면 디버깅 가치 상실"
+    )
+    # 401 등 실 진단 정보는 보존돼야 — 마스킹이 너무 광범위하면 디버깅 불가
+    assert "401" in msg
+    assert "fatal: unable to access" in msg
