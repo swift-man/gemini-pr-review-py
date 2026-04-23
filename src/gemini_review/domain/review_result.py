@@ -33,6 +33,12 @@ class ReviewResult:
         `path:line — body` 형태로 나열한다. body 는 이미 `[등급]` 접두사를 포함
         (PR #13 규약) 하고 있어 추가 가공 없이 그대로 노출한다.
 
+        **계약** (호출자 책임):
+        - `surface_findings` 는 `self.findings` 의 **부분집합** 이어야 한다. 인라인
+          카운트 안내는 `len(self.findings) - len(surface_findings)` 로 자동 계산되므로,
+          외부 finding 을 임의로 넣으면 카운트가 음수·과다 표시된다.
+        - 순서는 caller 가 의미 있게 정렬해 넘긴다 (보통 모델 출력 원순서 보존).
+
         finding 정보를 잃지 않으면서도 GitHub 의 인라인 룰을 어기지 않는 절충 — PR
         수신자가 본문 한 곳에서 "정상 인라인 N개 + 본문 surface M개" 모두 확인 가능.
         """

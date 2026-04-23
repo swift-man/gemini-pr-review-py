@@ -136,7 +136,14 @@ def test_request_object_raises_when_response_is_array(
         client._request_object("GET", "https://api.github.com/x", auth="token t")
 
 
-def _sample_pr() -> PullRequest:
+def _sample_pr(
+    *,
+    addable_lines: tuple[tuple[str, frozenset[int]], ...] = (),
+) -> PullRequest:
+    """Test 용 PullRequest 빌더. `addable_lines` 는 fetch_pull_request 시점에 사전
+    파싱된 결과를 시뮬레이션 — race condition 방지를 위해 post_review 가 이 캐시만
+    참조하므로 테스트도 이 필드로 인라인/surface 분기를 지정한다.
+    """
     return PullRequest(
         repo=RepoRef("o", "r"),
         number=9,
@@ -150,6 +157,7 @@ def _sample_pr() -> PullRequest:
         changed_files=("a.py",),
         installation_id=7,
         is_draft=False,
+        addable_lines=addable_lines,
     )
 
 
@@ -209,12 +217,12 @@ def test_post_review_partitions_findings_into_inline_and_surfaced(
 
     핵심 회귀 방지: 사전 분할이 깨지면 (1) 422 가 다시 발생하거나 (2) 본문 surface
     가 누락되거나 (3) 같은 finding 이 두 곳에 중복 노출되는 사고가 일어난다.
+    addable_lines 는 fetch_pull_request 시점에 캐시된 값 — post_review 는 추가로
+    /files 를 호출하지 않는다 (race condition 방지).
     """
     posted_bodies: list[dict[str, Any]] = []
-    # a.py 의 patch — 라인 5, 6 만 추가. line 42 는 diff 밖.
-    patches = {"a.py": "@@ -1,0 +5,2 @@\n+x\n+y\n"}
     monkeypatch.setattr(
-        urllib.request, "urlopen", _make_fake_urlopen(posted_bodies, patches)
+        urllib.request, "urlopen", _make_fake_urlopen(posted_bodies, {})
     )
     monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
 
@@ -229,8 +237,9 @@ def test_post_review_partitions_findings_into_inline_and_surfaced(
             Finding(path="a.py", line=42, body="[Critical] 라인 42 — diff 밖"),
         ),
     )
+    pr = _sample_pr(addable_lines=(("a.py", frozenset({5, 6})),))
 
-    client.post_review(_sample_pr(), result)
+    client.post_review(pr, result)
 
     # 단일 POST — 422 retry 발동 안 함
     assert len(posted_bodies) == 1, "사전 분할이 정확하면 retry 가 일어나면 안 된다"
@@ -245,7 +254,7 @@ def test_post_review_partitions_findings_into_inline_and_surfaced(
     body = str(posted["body"])
     assert "a.py:42" in body
     assert "[Critical] 라인 42" in body
-    # 인라인 카운트 안내는 1건 (5 - 4 = ... 이 아니라 inline_findings 길이 = 1)
+    # 인라인 카운트 안내는 inline_findings 길이 = 1
     assert "기술 단위 코멘트 1건" in body
     # surface 안내
     assert "1개 코멘트는 PR diff 범위 밖" in body
@@ -256,9 +265,8 @@ def test_post_review_all_inline_when_all_lines_addable(
 ) -> None:
     """모든 finding 이 addable 라인을 가리키면 surface 섹션 없이 인라인만 게시."""
     posted_bodies: list[dict[str, Any]] = []
-    patches = {"a.py": "@@ -1,0 +1,3 @@\n+x\n+y\n+z\n"}  # line 1,2,3 모두 addable
     monkeypatch.setattr(
-        urllib.request, "urlopen", _make_fake_urlopen(posted_bodies, patches)
+        urllib.request, "urlopen", _make_fake_urlopen(posted_bodies, {})
     )
     monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
 
@@ -271,8 +279,9 @@ def test_post_review_all_inline_when_all_lines_addable(
             Finding(path="a.py", line=2, body="[Minor] y"),
         ),
     )
+    pr = _sample_pr(addable_lines=(("a.py", frozenset({1, 2, 3})),))
 
-    client.post_review(_sample_pr(), result)
+    client.post_review(pr, result)
 
     body = str(posted_bodies[0]["body"])
     assert len(posted_bodies[0]["comments"]) == 2
@@ -283,11 +292,10 @@ def test_post_review_all_inline_when_all_lines_addable(
 def test_post_review_all_surfaced_when_no_addable_lines(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """파일이 binary 등으로 patch=None 이면 모든 finding 이 surface — 인라인 0건."""
+    """파일이 addable 라인 없음 (binary 등) 이면 모든 finding 이 surface — 인라인 0건."""
     posted_bodies: list[dict[str, Any]] = []
-    patches = {"binary.png": None}  # binary file 시뮬레이션
     monkeypatch.setattr(
-        urllib.request, "urlopen", _make_fake_urlopen(posted_bodies, patches)
+        urllib.request, "urlopen", _make_fake_urlopen(posted_bodies, {})
     )
     monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
 
@@ -299,8 +307,9 @@ def test_post_review_all_surfaced_when_no_addable_lines(
             Finding(path="binary.png", line=1, body="[Minor] meta data"),
         ),
     )
+    pr = _sample_pr(addable_lines=(("binary.png", frozenset()),))  # 빈 frozenset
 
-    client.post_review(_sample_pr(), result)
+    client.post_review(pr, result)
 
     posted = posted_bodies[0]
     assert posted["comments"] == []
@@ -309,18 +318,64 @@ def test_post_review_all_surfaced_when_no_addable_lines(
     assert "[Minor] meta data" in body
 
 
+def test_post_review_uses_cached_addable_lines_no_extra_files_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**race condition 회귀 방지**: post_review 가 추가로 /files 를 호출하면 안 된다.
+
+    리뷰 생성 도중 사용자가 새 커밋을 push 한 시나리오를 시뮬레이션 — 두 번째 /files
+    응답에는 다른 patch 가 들어있다고 가정. post_review 가 실수로 /files 를 다시 부르면
+    그 응답을 받아 라인 분류가 달라지므로, 이 테스트가 호출 자체를 감지하고 실패한다.
+    """
+    files_call_count = 0
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        nonlocal files_call_count
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        if "/files" in req.full_url:
+            files_call_count += 1
+            # 일부러 다른 데이터로 응답 — post_review 가 호출했다면 잘못된 분류로 이어짐
+            return _FakeResponse(
+                b'[{"filename": "a.py", "patch": "@@ -1 +1 @@\\n+stale\\n"}]'
+            )
+        # review POST 는 정상 응답
+        return _FakeResponse(b'{"id": 1}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    result = ReviewResult(
+        summary="요약",
+        event=ReviewEvent.COMMENT,
+        findings=(Finding(path="a.py", line=5, body="[Minor] x"),),
+    )
+    # 캐시된 addable_lines 만 신뢰해야 함
+    pr = _sample_pr(addable_lines=(("a.py", frozenset({5})),))
+
+    client.post_review(pr, result)
+
+    assert files_call_count == 0, (
+        "post_review 가 /files 를 호출하면 race condition 방지 의도가 무너진다"
+    )
+
+
 def test_post_review_safety_net_moves_inline_to_body_on_unexpected_422(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """사전 분할이 잘못 판정한 희소 케이스 (예: GitHub patch truncate) — 422 가 나면
     남은 inline 들도 body 로 옮기고 retry. 정보 손실 없이 게시 보장."""
     posted_bodies: list[dict[str, Any]] = []
-    # patch 는 line 1 만 addable 이라고 알려주지만, GitHub 는 422 로 거부 (시뮬레이션)
-    patches = {"a.py": "@@ -1,0 +1,1 @@\n+x\n"}
     monkeypatch.setattr(
         urllib.request,
         "urlopen",
-        _make_fake_urlopen(posted_bodies, patches, fail_first_review_with_422=True),
+        _make_fake_urlopen(posted_bodies, {}, fail_first_review_with_422=True),
     )
     monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
 
@@ -332,9 +387,12 @@ def test_post_review_safety_net_moves_inline_to_body_on_unexpected_422(
             Finding(path="a.py", line=1, body="[Critical] 우리는 addable 이라 봤지만 GitHub 가 거부"),
         ),
     )
+    # 우리 분할은 line 1 이 addable 이라고 판정 — 그래서 1차 POST 에 인라인으로 들어간다.
+    # 하지만 fake GitHub 가 422 로 거부 (예: 실제론 patch truncate 였던 케이스 시뮬레이션)
+    pr = _sample_pr(addable_lines=(("a.py", frozenset({1})),))
 
     # 예외 삼켜져야 함 (retry 성공)
-    client.post_review(_sample_pr(), result)
+    client.post_review(pr, result)
 
     assert len(posted_bodies) == 2, "1차 + retry = 2회"
     # 1차: 우리 분할 결과대로 inline 1건 시도
@@ -424,9 +482,97 @@ def test_post_review_does_not_retry_on_non_422(
         event=ReviewEvent.COMMENT,
         findings=(Finding(path="a.py", line=5, body="x"),),
     )
+    pr = _sample_pr(addable_lines=(("a.py", frozenset({5})),))
 
     with pytest.raises(urllib.error.HTTPError) as exc:
-        client.post_review(_sample_pr(), result)
+        client.post_review(pr, result)
 
     assert exc.value.code == 500
     assert call_count == 1
+
+
+def test_fetch_pull_request_collects_addable_lines_with_single_files_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fetch_pull_request 가 /files 한 번 호출로 changed_files + addable_lines 를 동시 수집.
+
+    회귀 방지: 이걸 두 번 나눠 호출하면 (1) 라운드트립 낭비 (2) race condition 위험
+    (두 번째 호출이 새 head_sha 의 patch 를 받을 수 있음). 한 호출에서 함께 처리하는
+    것이 일관성 보장의 핵심.
+    """
+    files_call_count = 0
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        nonlocal files_call_count
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        if "/files" in req.full_url:
+            files_call_count += 1
+            return _FakeResponse(json.dumps([
+                {"filename": "src/a.py", "patch": "@@ -1,0 +5,2 @@\n+x\n+y\n"},
+                {"filename": "binary.png", "patch": None},  # binary file
+            ]).encode())
+        # /pulls/{n} 메타데이터
+        return _FakeResponse(json.dumps({
+            "title": "t",
+            "body": "b",
+            "draft": False,
+            "head": {"sha": "abc", "ref": "feat", "repo": {"clone_url": "https://x.git"}},
+            "base": {"sha": "def", "ref": "main"},
+        }).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # 단일 호출 — 두 번 부르면 race condition 위험
+    assert files_call_count == 1
+
+    # changed_files 와 addable_lines 모두 채워졌어야
+    assert pr.changed_files == ("src/a.py", "binary.png")
+    addable = pr.addable_lines_by_path()
+    assert addable["src/a.py"] == frozenset({5, 6})
+    # binary 파일은 patch=None → 빈 frozenset (보수적)
+    assert addable["binary.png"] == frozenset()
+
+
+def test_http_attaches_response_detail_to_httperror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_http` 가 422 등 에러 응답 본문을 exc 에 첨부 — 호출부의 분기 정확도 향상.
+
+    `exc.read()` 는 1회용 stream 이라 _http 에서 한 번 읽고 나면 호출부가 다시 못 읽음.
+    `gemini_review_detail` 커스텀 속성으로 첨부해 두면, 향후 retry 로직이 "line must be
+    part of the diff" 같은 구체 사유로 분기를 좁힐 수 있다.
+    """
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            urllib.error.HTTPError(
+                "https://api.github.com/x",
+                422,
+                "Unprocessable Entity",
+                {},  # type: ignore[arg-type]
+                io.BytesIO(b'{"message": "Validation Failed", "errors": ["foo"]}'),
+            )
+        ),
+    )
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        client._http("GET", "https://api.github.com/x", auth="token t")
+
+    detail = getattr(exc_info.value, "gemini_review_detail", None)
+    assert detail is not None, "HTTPError 에 응답 본문이 첨부돼야 한다"
+    assert "Validation Failed" in detail
+    assert "foo" in detail

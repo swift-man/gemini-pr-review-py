@@ -45,19 +45,15 @@ def addable_lines_from_patch(patch: str | None) -> set[int]:
                 # 정확한 시작 라인 번호가 된다.
                 new_line_no = int(match.group(1)) - 1
         elif line.startswith("+++") or line.startswith("---"):
-            # diff 헤더 라인 (`+++ b/path`, `--- a/path`) — 본문 아님
+            # diff 헤더 라인 (`+++ b/path`, `--- a/path`) — 본문 아님.
+            # `+++` 가 `+` 보다 먼저 검사돼야 아래 분기에서 헤더가 추가 라인으로 잘못
+            # 분류되지 않는다 (순서 의존성).
             continue
-        elif line.startswith("+"):
+        elif line.startswith(("+", " ")):
+            # 추가(`+`) 와 hunk 안 context(` `) 모두 RIGHT 사이드에 존재하므로
+            # 새 파일 라인 카운터를 +1 하고 addable 에 추가 (GitHub 도 둘 다 허용).
             new_line_no += 1
             addable.add(new_line_no)
-        elif line.startswith(" "):
-            # context 라인 — 변경되지 않았지만 hunk 안에 있으니 코멘트 허용
-            new_line_no += 1
-            addable.add(new_line_no)
-        elif line.startswith("-"):
-            # RIGHT 사이드에 없는 라인 — 카운터를 옮기지 않는다
-            continue
-        else:
-            # `\ No newline at end of file` 같은 메타 라인 — 무시
-            continue
+        # 그 외 (`-` 제거 라인, `\ No newline at end of file` 메타) 는 RIGHT 사이드에
+        # 영향 없음 — 카운터를 옮기지 않고 통과.
     return addable

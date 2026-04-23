@@ -91,16 +91,34 @@ class GitHubAppClient:
         pr_url = f"{self._api_base}/repos/{repo.full_name}/pulls/{number}"
         pr_data = self._request_object("GET", pr_url, auth=f"token {token}")
 
-        # 변경 파일 전체를 가져와야 우선순위 정렬(변경 파일 먼저)이 정확해진다.
+        # /files 한 번 호출로 두 가지를 동시 수집:
+        #   1) changed_files 목록 (file_collector 우선순위 정렬용)
+        #   2) 각 파일의 patch → addable_lines 사전 파싱 (post_review 인라인 분할용)
+        # post_review 시점에 같은 호출을 다시 하면 그 사이 사용자가 push 한 새 커밋의
+        # patch 를 받게 돼 모델 finding 의 라인 번호와 불일치하는 race condition 이
+        # 발생함. head_sha 시점에 한 번만 fetch 해 PullRequest 에 캐싱하는 것이 핵심.
         # per_page=100 은 GitHub 허용 최대치라 PR 이 큰 경우의 라운드트립 수를 최소화.
         files_url = f"{pr_url}/files?per_page=100"
         changed: list[str] = []
+        addable: list[tuple[str, frozenset[int]]] = []
         page = 1
         while True:
             files = self._request_list("GET", f"{files_url}&page={page}", auth=f"token {token}")
             if not files:
                 break
-            changed.extend(str(f["filename"]) for f in files)
+            for file_entry in files:
+                filename = str(file_entry["filename"])
+                changed.append(filename)
+                # patch 가 None 인 경우(binary, 삭제, GitHub truncate) → 빈 frozenset.
+                # 그 결과 해당 파일의 모든 finding 은 본문 surface 로 내려간다 (보수적).
+                # patch truncate 정책: GitHub 가 대용량 diff 를 줄여서 보내는 경우, 잘린
+                # 영역의 라인은 addable 로 분류되지 않아 인라인 가능했어도 본문 surface
+                # 로 내려간다. "인라인 손실 0" 보다 "잘못된 인라인 위치 안 만듦" 을 우선.
+                patch = file_entry.get("patch")
+                lines = addable_lines_from_patch(
+                    patch if isinstance(patch, str) else None
+                )
+                addable.append((filename, frozenset(lines)))
             # 100개 미만이면 마지막 페이지 — Link 헤더 대신 길이로 단순 판정.
             if len(files) < 100:
                 break
@@ -121,6 +139,7 @@ class GitHubAppClient:
             changed_files=tuple(changed),
             installation_id=installation_id,
             is_draft=bool(pr_data.get("draft", False)),
+            addable_lines=tuple(addable),
         )
 
     def post_review(self, pr: PullRequest, result: ReviewResult) -> None:
@@ -132,20 +151,20 @@ class GitHubAppClient:
         url = f"{self._api_base}/repos/{pr.repo.full_name}/pulls/{pr.number}/reviews"
 
         # 모델은 전체 코드베이스를 보고 임의 라인을 지적할 수 있지만 GitHub Reviews API 는
-        # diff 안 라인에만 인라인 코멘트를 허용한다. 사전에 PR 의 patch 들을 파싱해 유효
-        # (path, line) 집합을 구해 두고, finding 을 두 갈래로 분할한다:
+        # diff 안 라인에만 인라인 코멘트를 허용한다. fetch_pull_request 시점에 사전 파싱된
+        # `pr.addable_lines` 를 사용해 finding 을 두 갈래로 분할:
         #   - inline_findings: 그 집합에 들어가는 것 → 정상 인라인 코멘트로 게시
         #   - surfaced_findings: 그 외 → 본문으로 promote 해 file:line + 등급·내용 노출
-        # 이 사전 분할 덕분에 422 자체가 거의 발생하지 않고, 발생하더라도 retry 가
-        # 안전망으로 남는다 (예: GitHub patch 가 truncate 돼서 우리가 "허용" 으로 분류한
-        # 라인이 실제론 거부되는 희소 케이스).
+        # 사전 분할 덕분에 422 자체가 거의 발생하지 않고, 발생하더라도 retry 가 안전망으로
+        # 남는다 (예: GitHub patch 가 truncate 돼서 우리가 "허용" 으로 분류한 라인이 실제론
+        # 거부되는 희소 케이스). 캐시를 쓰는 것은 race condition 방지 — 리뷰 생성 도중
+        # 사용자가 새 커밋을 push 했을 때 patch 가 갱신돼 모델 finding 의 라인 번호와
+        # 불일치하는 사고를 막는다.
         if result.findings:
-            addable_lines = self._fetch_addable_lines(pr)
             inline_findings, surfaced_findings = _partition_findings(
-                result.findings, addable_lines
+                result.findings, pr.addable_lines_by_path()
             )
         else:
-            # findings 가 비어 있으면 /files 호출 자체가 낭비. 불필요한 라운드트립 절약.
             inline_findings = ()
             surfaced_findings = ()
         if surfaced_findings:
@@ -187,35 +206,6 @@ class GitHubAppClient:
                 surface_findings=surfaced_findings + inline_findings
             )
             self._request_object("POST", url, auth=f"token {token}", body=payload)
-
-    def _fetch_addable_lines(self, pr: PullRequest) -> dict[str, set[int]]:
-        """PR 의 각 변경 파일에 대해 인라인 코멘트가 허용되는 RIGHT-side 라인 집합 반환.
-
-        Reviews API 의 검증 룰("comments.line 은 diff 안에 있어야 함") 을 우리 쪽에서
-        동등하게 재현. patch 를 파싱하므로 binary/삭제/truncated patch 인 경우엔 빈
-        집합 → 해당 파일에 대한 모든 finding 이 본문으로 surface 된다.
-        """
-        token = self.get_installation_token(pr.installation_id)
-        files_url = (
-            f"{self._api_base}/repos/{pr.repo.full_name}/pulls/{pr.number}/files?per_page=100"
-        )
-        addable: dict[str, set[int]] = {}
-        page = 1
-        while True:
-            files = self._request_list("GET", f"{files_url}&page={page}", auth=f"token {token}")
-            if not files:
-                break
-            for entry in files:
-                filename = str(entry.get("filename", ""))
-                patch = entry.get("patch")
-                if filename:
-                    addable[filename] = addable_lines_from_patch(
-                        patch if isinstance(patch, str) else None
-                    )
-            if len(files) < 100:
-                break
-            page += 1
-        return addable
 
     def post_comment(self, pr: PullRequest, body: str) -> None:
         if self._dry_run:
@@ -296,7 +286,12 @@ class GitHubAppClient:
             with urllib.request.urlopen(req, timeout=30, context=self._tls_context) as resp:  # noqa: S310
                 return json.loads(resp.read().decode("utf-8") or "{}")
         except urllib.error.HTTPError as exc:
+            # `exc.read()` 는 1회용 stream — 여기서 읽고 나면 호출부가 다시 못 읽는다.
+            # 호출부가 422 의 구체 사유(예: "line must be part of the diff" vs 다른 검증
+            # 실패) 를 분기에 활용할 수 있도록 읽은 본문을 `gemini_review_detail` 커스텀
+            # 속성으로 첨부. 직접 `exc.detail` 같은 표준 속성과 충돌하지 않게 prefix.
             detail = exc.read().decode("utf-8", errors="replace")
+            exc.gemini_review_detail = detail  # type: ignore[attr-defined]
             logger.error("GitHub %s %s failed: %s %s", method, url, exc.code, detail[:500])
             raise
 
@@ -307,7 +302,7 @@ def _finding_to_comment(f: Finding) -> dict[str, object]:
 
 def _partition_findings(
     findings: tuple[Finding, ...],
-    addable_lines: dict[str, set[int]],
+    addable_lines: dict[str, frozenset[int]],
 ) -> tuple[tuple[Finding, ...], tuple[Finding, ...]]:
     """findings 를 (인라인 가능, surfaced) 두 튜플로 분할.
 
@@ -319,7 +314,9 @@ def _partition_findings(
     inline: list[Finding] = []
     surfaced: list[Finding] = []
     for f in findings:
-        if f.line in addable_lines.get(f.path, set()):
+        # `dict.get(path, set())` 대신 in 체크로 빈 set 객체 생성 회피.
+        # finding 수만큼 임시 set 이 생기는 것을 막아 hot path 에서 사소한 메모리 절약.
+        if f.path in addable_lines and f.line in addable_lines[f.path]:
             inline.append(f)
         else:
             surfaced.append(f)
