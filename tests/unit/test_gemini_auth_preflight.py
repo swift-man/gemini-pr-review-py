@@ -359,3 +359,51 @@ def test_review_raises_when_all_models_time_out(
         "gemini-3.1-pro-preview",
         "gemini-2.5-pro",
     ]
+
+
+def test_review_drops_findings_on_paths_outside_pr_changed_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """엔진이 `pr.changed_files` 를 valid_paths 로 전달해 환각 path finding 을 드롭한다.
+
+    회귀 방지: parse_review 에 valid_paths 가 안 넘어가면 모델이 만든 가짜 path finding
+    이 그대로 살아남아 본문 surface 또는 잘못된 인라인 시도로 이어진다. 이 테스트는
+    엔진→파서 배선이 항상 changed_files 를 함께 넘기는지 고정한다.
+    """
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> _FakeCompleted:
+        return _FakeCompleted(
+            0,
+            (
+                '{"summary": "ok", "event": "COMMENT", "comments": ['
+                '{"path": "src/a.py", "line": 1, "body": "[Minor] 실재"},'
+                '{"path": "tests/imaginary.py", "line": 1, "body": "[Critical] 가짜"}'
+                "]}"
+            ),
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    pr = PullRequest(
+        repo=RepoRef("o", "r"),
+        number=1,
+        title="t",
+        body="",
+        head_sha="abc",
+        head_ref="feat",
+        base_sha="def",
+        base_ref="main",
+        clone_url="https://example.com/o/r.git",
+        changed_files=("src/a.py",),  # `tests/imaginary.py` 는 PR 에 없음
+        installation_id=7,
+        is_draft=False,
+    )
+
+    result = GeminiCliEngine(binary="gemini", model="gemini-2.5-pro").review(
+        pr, FileDump(entries=(), total_chars=0)
+    )
+
+    paths = [f.path for f in result.findings]
+    assert paths == ["src/a.py"], (
+        "PR changed_files 밖의 finding 은 엔진이 파서에 전달한 valid_paths 로 드롭돼야 함"
+    )

@@ -154,7 +154,13 @@ class GeminiCliEngine:
                 # `parse_review` 는 CLI 출력만 해석하므로 어느 모델이 이 결과를 만들었는지
                 # 모른다. 여기서 한 번에 주입해서 fallback 발동 시 운영자가 본문 푸터로
                 # 실제 사용 모델을 바로 확인할 수 있게 한다.
-                return dataclasses.replace(parse_review(result.stdout), model=model)
+                # `valid_paths` 는 path grounding — 모델이 PR 에 존재하지 않는 파일을
+                # 지적하는 환각(예: fictional `tests/unit/test_github_app_client.py`) 을
+                # 파서 단계에서 드롭하는 데 쓰인다.
+                parsed = parse_review(
+                    result.stdout, valid_paths=frozenset(pr.changed_files)
+                )
+                return dataclasses.replace(parsed, model=model)
 
             last_error = _combined_output(result)
             if has_fallback and _is_retryable_model_failure(last_error):

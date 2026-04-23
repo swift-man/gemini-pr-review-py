@@ -136,3 +136,126 @@ def test_parse_accepts_all_four_severity_tiers_without_warning(
     assert len(result.findings) == 4
     severity_warnings = [r for r in caplog.records if "severity tag" in r.getMessage()]
     assert severity_warnings == [], "정상 태그엔 severity 관련 WARN 이 없어야 한다"
+
+
+# --- Path grounding (사용자 신고 사례 2 차단) -------------------------------
+
+
+def test_parse_drops_finding_on_path_not_in_valid_paths(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`valid_paths` 가 주어지면 그 집합에 없는 path 는 환각으로 간주하고 드롭한다.
+
+    실관측 사례: 모델이 PR 에 존재하지 않는 `tests/unit/test_github_app_client.py` 를
+    "httpx 리팩터링 후 urllib 잔존" 같은 강한 주장과 함께 지적. path 검증으로 이런
+    환각이 게시 자체에 도달하지 않도록 차단.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "COMMENT",
+      "comments": [
+        {"path": "src/real.py", "line": 10, "body": "[Major] 실제 변경 파일"},
+        {"path": "tests/imaginary.py", "line": 1, "body": "[Critical] 가짜 파일"}
+      ]
+    }
+    """
+    with caplog.at_level(logging.WARNING):
+        result = parse_review(raw, valid_paths=frozenset({"src/real.py"}))
+
+    paths = [f.path for f in result.findings]
+    assert paths == ["src/real.py"], "valid_paths 밖의 finding 은 드롭돼야 함"
+    drop_warnings = [r for r in caplog.records if "non-changed path" in r.getMessage()]
+    assert len(drop_warnings) == 1
+    assert "tests/imaginary.py" in drop_warnings[0].getMessage()
+
+
+def test_parse_skips_path_grounding_when_valid_paths_empty() -> None:
+    """`valid_paths` 가 빈 frozenset 이면 검증 생략 — 단위 테스트 호환성 보장."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "COMMENT",
+      "comments": [
+        {"path": "any/path.py", "line": 1, "body": "[Minor] x"}
+      ]
+    }
+    """
+    result = parse_review(raw)  # valid_paths 미지정 → 검증 안 함
+    assert len(result.findings) == 1
+    assert result.findings[0].path == "any/path.py"
+
+
+# --- Severity downgrade on hallucination (사용자 신고 사례 1·4 차단) --------
+
+
+def test_parse_downgrades_critical_to_suggestion_on_literal_n_hallucination(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """실관측된 escape 환각 표현이 [Critical]/[Major] 본문에 있으면 [Suggestion] 으로 강등.
+
+    회귀 방지: 사용자 신고 사례 1 (`\\n` 을 literal `n` 으로 잘못 읽음) 가 [Major]
+    등급으로 게시되어 false positive PR 차단으로 이어진 것을 방지.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "REQUEST_CHANGES",
+      "comments": [
+        {"path": "tests/x.py", "line": 5, "body": "[Major] 테스트 픽스처에서 개행 문자 이스케이프 누락되어 리터럴 'n' 으로 하드코딩됨"}
+      ]
+    }
+    """
+    with caplog.at_level(logging.WARNING):
+        result = parse_review(raw)
+
+    assert len(result.findings) == 1
+    body = result.findings[0].body
+    # 강등됐는지: 새 본문이 [Suggestion] 으로 시작
+    assert body.startswith("[Suggestion]")
+    # 원래 등급이 무엇이었는지 안내 문구로 노출 — silent rewrite 방지
+    assert "자동 강등" in body
+    assert "원래 [Major]" in body
+    # 강등 사실이 WARN 으로 로깅됨 — 운영자가 빈도 추적 가능
+    downgrade_warnings = [r for r in caplog.records if "downgrading severity" in r.getMessage()]
+    assert len(downgrade_warnings) == 1
+
+
+def test_parse_does_not_downgrade_legitimate_critical_without_hallucination_marker() -> None:
+    """환각 패턴이 없는 정상 [Critical] 은 유지 — 거짓 양성 방지.
+
+    회귀 방지: hallucination 패턴 매칭이 너무 공격적이면 정당한 Critical 이 강등돼
+    리뷰 시스템 신호 가치가 오히려 떨어진다. 일반 단어("escape") 만으로는 매칭하지
+    않고, 실관측된 강한 표지("리터럴 'n'" 등) 만 잡아야 한다.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "REQUEST_CHANGES",
+      "comments": [
+        {"path": "src/a.py", "line": 10, "body": "[Critical] sys.exit(1) 호출이 uvicorn 을 종료시켜 진행 중인 다른 리뷰 유실. 일반 escape 처리 관련 함수임"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert len(result.findings) == 1
+    assert result.findings[0].body.startswith("[Critical]"), "정상 Critical 은 그대로 유지"
+    assert "자동 강등" not in result.findings[0].body
+
+
+def test_parse_does_not_downgrade_minor_or_suggestion() -> None:
+    """이미 [Minor]/[Suggestion] 인 본문에 환각 패턴이 있어도 강등 안 함 (의미 없음)."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "COMMENT",
+      "comments": [
+        {"path": "x.py", "line": 1, "body": "[Minor] 이스케이프 누락 같은 가능성"},
+        {"path": "y.py", "line": 2, "body": "[Suggestion] literal 'n' 처리 검토"}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.findings[0].body.startswith("[Minor]")
+    assert result.findings[1].body.startswith("[Suggestion]")
+    assert all("자동 강등" not in f.body for f in result.findings)

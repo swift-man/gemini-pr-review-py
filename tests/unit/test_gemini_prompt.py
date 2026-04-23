@@ -194,3 +194,24 @@ def test_prompt_warns_against_escape_sequence_hallucination() -> None:
     assert "이중 escape" in prompt or "\\\\n" in prompt
     # 자신 없으면 생략하라는 지침 — 환각 false positive 의 직접 차단
     assert "확인할 수 없는 주장은 하지 말" in prompt or "자신이 없으면" in prompt
+
+
+def test_prompt_contains_path_grounding_and_severity_discipline() -> None:
+    """`## 출처 검증` 섹션 + Critical/Major 규율 + 실관측 환각 사례 인용을 모두 검증.
+
+    회귀 방지: 사용자 신고 (가짜 파일 지적, Major 등급 남용) 에 대응한 프롬프트
+    조항이 빠지면 다시 같은 환각이 빈도 높게 나올 위험.
+    """
+    dump = FileDump(entries=(), total_chars=0)
+    prompt = build_prompt(_pr(), dump)
+
+    # 새 섹션 헤더 존재
+    assert "## 출처 검증" in prompt
+    # 파서가 자동 차단하는 케이스를 모델도 인지하도록 명시
+    assert "changed_files" in prompt
+    # 강한 주장 + 가짜 출처 조합 금지 — 실관측 사례 인용
+    assert "CI 즉시 실패" in prompt
+    # Major/Critical 규율
+    assert "확신이 낮은 지적" in prompt or "확신 낮으면" in prompt
+    # 실관측 escape 환각 표현 인용 — 모델이 같은 표현을 안 답습하도록
+    assert "리터럴 'n'" in prompt or "리터럴 \"n\"" in prompt
