@@ -388,36 +388,35 @@ def test_parse_does_not_touch_approve_event() -> None:
     assert result.event == ReviewEvent.APPROVE
 
 
-def test_parse_weakens_request_changes_when_no_findings_and_no_improvements() -> None:
-    """REQUEST_CHANGES 인데 인라인 0건 + improvements 0건 = 차단 신호 어디에도 없음.
+def test_parse_weakens_request_changes_when_no_findings_at_all() -> None:
+    """REQUEST_CHANGES 인데 인라인 0건이면 약화. improvements 는 차단 근거 아님.
 
-    이 케이스만 약화 정당. 모델이 차단을 외쳤지만 본문/인라인 어디에도 그 근거가
-    없다 — 약화해서 자연스러운 상태로 만든다.
+    `improvements` 는 현재 프롬프트 스키마상 권장 개선 섹션이지 차단 전용 섹션이 아니다.
+    따라서 `comments=[]` 면 차단 신호가 없는 셈 — 약화 정당.
     """
     raw = """
     {
       "summary": "ok",
       "event": "REQUEST_CHANGES",
-      "comments": [],
-      "improvements": []
+      "comments": []
     }
     """
     result = parse_review(raw)
     assert result.event == ReviewEvent.COMMENT
 
 
-def test_parse_keeps_request_changes_when_improvements_carry_blocking_rationale(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """improvements 비어있지 않으면 약화 보류 — codex #20 후속 회귀 방지.
+def test_parse_weakens_request_changes_when_only_improvements_remain() -> None:
+    """비차단 improvements 만 남으면 약화 — codex PR #20 #3 회귀 방지.
 
-    실관측 시나리오: 라인 고정 불가능한 모듈/설계 단위 차단 사유 (예: "이 흐름은
-    중복 처리 + 데이터 손실 위험" 같이 코드 한 줄에 안 묶이는 것) 를 모델이
-    `improvements` 에 적고 `REQUEST_CHANGES` 선택. 인라인 finding 은 0개일 수 있다.
+    실관측 시나리오: 모델이 환각 [Critical] finding + 사소한 improvements 항목을 함께
+    내고 REQUEST_CHANGES 선택. 우리가 path grounding 또는 강등으로 finding 을 모두
+    지웠는데 improvements 만 남으면, **이전 commit 의 over-correction 으로 약화 보류**
+    하던 동작이 PR 을 잘못 차단했다. improvements 는 "권장 개선" 섹션이지 차단 전용이
+    아니다.
 
-    이 때 우리가 `comments=[]` 만 보고 약화하면 본문 차단 근거를 무시하고 차단 신호를
-    지운다. improvements 가 비어있지 않은 한 약화 보류 — 모델이 본문에 적은 차단 사유를
-    존중한다 (필터링 대상도 아님).
+    회귀 방지: improvements 가 차단 근거로 오해돼 약화가 막히는 경향이 다시 살아나면
+    이 테스트가 실패한다. 차단 본문 표현이 정말 필요해지면 스키마에 `must_fix` 같은
+    별도 필드를 도입해야 (이 PR 범위 밖).
     """
     raw = """
     {
@@ -425,26 +424,44 @@ def test_parse_keeps_request_changes_when_improvements_carry_blocking_rationale(
       "event": "REQUEST_CHANGES",
       "comments": [],
       "improvements": [
-        "이 모듈은 동시성 진입점이 두 군데로 갈려 있어 데이터 손실 위험이 있다"
+        "변수 이름을 더 명확하게",
+        "주석을 추가하면 좋겠음"
       ]
     }
     """
-    with caplog.at_level(logging.WARNING):
-        result = parse_review(raw)
-
-    assert result.event == ReviewEvent.REQUEST_CHANGES, (
-        "improvements 에 본문 차단 근거가 있으면 약화 보류해야 한다"
+    result = parse_review(raw)
+    assert result.event == ReviewEvent.COMMENT, (
+        "improvements 만 남으면 약화 — 비차단 항목이 PR 차단을 일으키면 안 됨"
     )
-    assert result.improvements == (
-        "이 모듈은 동시성 진입점이 두 군데로 갈려 있어 데이터 손실 위험이 있다",
+
+
+def test_parse_weakens_request_changes_when_blocking_dropped_but_improvements_remain() -> None:
+    """codex PR #20 #3 권장 회귀 테스트: blocking 강등 + 비차단 improvements 남음 시나리오.
+
+    가장 정밀한 false-positive 회귀 케이스: 모델이 [Critical] finding (환각) + 비차단
+    improvements 를 함께 냈고 REQUEST_CHANGES 선택. 환각 강등으로 finding 의 차단력이
+    [Suggestion] 으로 떨어진 후 — improvements 만 비차단으로 남는 상황. 이 때
+    REQUEST_CHANGES 가 유지되면 환각 + 사소한 개선 두 가지로 PR 이 차단되는 false positive.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "REQUEST_CHANGES",
+      "comments": [
+        {"path": "a.py", "line": 1, "body": "[Critical] 리터럴 'n' 으로 처리됨 (환각)"}
+      ],
+      "improvements": [
+        "변수 이름 정리"
+      ]
+    }
+    """
+    result = parse_review(raw)
+    # finding 은 [Suggestion] 으로 강등돼 살아 있음
+    assert result.findings[0].body.startswith("[Suggestion]")
+    # blocking 0개 + 비차단 improvements 만 → 약화 발동
+    assert result.event == ReviewEvent.COMMENT, (
+        "환각 강등 후 비차단 improvements 만 남으면 PR 을 차단하면 안 됨 (false positive)"
     )
-    keep_warns = [
-        r for r in caplog.records
-        if "improvement entries remain in body" in r.getMessage()
-    ]
-    assert len(keep_warns) == 1, "improvements 보존 사실이 운영 로그로 남아야 한다"
-
-
 
 
 def test_parse_keeps_request_changes_when_untagged_finding_hides_blocking_intent(

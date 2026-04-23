@@ -66,28 +66,22 @@ def parse_review(
 
     raw_event = _parse_event(payload.get("event"))
     findings = tuple(_parse_findings(payload.get("comments"), valid_paths=valid_paths))
-    improvements = tuple(_as_str_list(payload.get("improvements")))
-    # 등급 강등/path 드롭 이후 남은 finding + improvements 분포로 event 재정합. 모델이
-    # 환각 기반 [Critical] 을 보고 REQUEST_CHANGES 를 골랐는데 우리가 그걸 [Suggestion]
-    # 으로 강등하거나 통째로 드롭했고, 본문 차단 근거(`improvements`) 도 비어 있다면,
-    # REQUEST_CHANGES 는 더 이상 정당하지 않다.
-    event = _normalize_event(raw_event, findings, improvements)
+    # 등급 강등/path 드롭 이후 남은 finding 분포로 event 재정합. 모델이 환각 기반
+    # [Critical] 을 보고 REQUEST_CHANGES 를 골랐는데 우리가 그걸 [Suggestion] 으로
+    # 강등하거나 통째로 드롭했다면, REQUEST_CHANGES 는 더 이상 정당하지 않다.
+    event = _normalize_event(raw_event, findings)
 
     return ReviewResult(
         summary=str(payload.get("summary", "")).strip() or "요약 없음",
         event=event,
         positives=tuple(_as_str_list(payload.get("positives"))),
-        improvements=improvements,
+        improvements=tuple(_as_str_list(payload.get("improvements"))),
         findings=findings,
     )
 
 
-def _normalize_event(
-    event: ReviewEvent,
-    findings: tuple[Finding, ...],
-    improvements: tuple[str, ...],
-) -> ReviewEvent:
-    """필터링/강등 이후 finding/improvements 분포로 REQUEST_CHANGES 를 약화 (강화는 안 함).
+def _normalize_event(event: ReviewEvent, findings: tuple[Finding, ...]) -> ReviewEvent:
+    """필터링/강등 이후 finding 분포로 REQUEST_CHANGES 를 약화 (강화는 안 함).
 
     원칙: **약화 전용**. 모델이 COMMENT 를 골랐다면 거기엔 모델만 아는 맥락(예: 본문에는
     Critical 코멘트가 있지만 PR 자체는 WIP 라 차단할 단계가 아님) 이 있을 수 있어 우리가
@@ -98,21 +92,23 @@ def _normalize_event(
     APPROVE 는 우리가 손대지 않는다 — 모델이 "통과시켜라" 라고 적극 표현한 건 우리
     필터링과 무관하게 존중. (우리는 승인의 적합성을 판단할 정보가 없다.)
 
-    ### 차단 신호 보존 규칙 (보수적 우선)
+    ### 약화 보류 규칙 (보수적 우선)
 
     아래 중 하나라도 만족하면 **약화 보류** — 모델 REQUEST_CHANGES 의도를 존중:
 
     1. **finding 에 `[Critical]`/`[Major]` 가 살아 있음** — 인라인 차단 사유 명확히 존재.
     2. **태그 누락 finding 이 있음** — 본문 앞 `[등급]` 접두사 누락은 파서 정책상
        드롭하지 않고 게시 (WARN 만). "태그 없음 = 비차단" 으로 단순 해석하면 모델이
-       태그만 깜빡한 차단급 본문을 약화로 지워버리는 false negative 발생 (codex #20).
-    3. **improvements 가 비어 있지 않음** — 라인에 고정할 수 없는 모듈/설계 단위 차단
-       사유 (예: "이 흐름은 데이터 손실 위험") 가 본문 섹션에 남아 있을 수 있다. 우리는
-       improvements 를 필터링하지 않으므로 모델이 적은 차단 근거가 본문에 살아 있는 셈
-       (codex #20 #2). 보수적으로 약화 보류.
+       태그만 깜빡한 차단급 본문을 약화로 지워버리는 false negative 발생.
 
-    약화 발동 조건: REQUEST_CHANGES + 위 세 가지가 모두 거짓. 즉 모델이 차단을 외쳤지만
-    우리가 후처리로 그 근거를 모조리 지운 깨끗한 상태에서만 약화한다.
+    `improvements` 는 차단 근거로 쓰지 **않는다** (codex PR #20 review #3): 현재 프롬프트
+    스키마상 `improvements` 는 라인 고정이 어려운 **권장 개선** 섹션이지 차단 전용
+    섹션이 아니다. 비어있지 않다는 이유만으로 약화를 막으면 사소한 개선 한 줄 때문에
+    PR 이 잘못 차단되는 false positive 가 발생한다. 차단 신호를 본문 차원에서 표현하려면
+    스키마에 `must_fix` 같은 차단 전용 필드를 도입하는 게 옳은 방향 — 별도 작업.
+
+    약화 발동 조건: REQUEST_CHANGES + 위 두 가지가 모두 거짓. 즉 모델이 차단을 외쳤지만
+    우리가 finding 후처리로 그 근거를 모조리 지운 깨끗한 상태에서만 약화한다.
     """
     if event != ReviewEvent.REQUEST_CHANGES:
         return event
@@ -128,18 +124,9 @@ def _normalize_event(
             missing_tag_count,
         )
         return event
-    # improvements 에 모델이 적은 본문 차단 근거가 남아 있으면 약화 보류 (codex #20 #2).
-    # 라인 고정 불가능한 모듈/설계 단위 차단 이슈는 inline finding 으로 표현될 수 없다.
-    if improvements:
-        logger.warning(
-            "keeping REQUEST_CHANGES despite no blocking finding: "
-            "%d improvement entries remain in body and may carry blocking rationale",
-            len(improvements),
-        )
-        return event
     logger.warning(
         "weakening REQUEST_CHANGES -> COMMENT: no [Critical]/[Major] findings survive "
-        "and improvements is empty (no blocking signal anywhere). %d findings remain.",
+        "(filter/downgrade dropped them all). %d findings remain.",
         len(findings),
     )
     return ReviewEvent.COMMENT
