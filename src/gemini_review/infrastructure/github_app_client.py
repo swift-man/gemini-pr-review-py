@@ -126,16 +126,19 @@ class GitHubAppClient:
 
         head = pr_data["head"]
         base = pr_data["base"]
+        head_sha = str(head["sha"])
+        clone_url, fetch_ref = _resolve_fetch_source(repo, number, head_sha, head, base)
         return PullRequest(
             repo=repo,
             number=number,
             title=str(pr_data.get("title", "")),
             body=str(pr_data.get("body") or ""),
-            head_sha=str(head["sha"]),
+            head_sha=head_sha,
             head_ref=str(head["ref"]),
             base_sha=str(base["sha"]),
             base_ref=str(base["ref"]),
-            clone_url=str(head["repo"]["clone_url"]),
+            clone_url=clone_url,
+            fetch_ref=fetch_ref,
             changed_files=tuple(changed),
             installation_id=installation_id,
             is_draft=bool(pr_data.get("draft", False)),
@@ -294,6 +297,56 @@ class GitHubAppClient:
             exc.gemini_review_detail = detail  # type: ignore[attr-defined]
             logger.error("GitHub %s %s failed: %s %s", method, url, exc.code, detail[:500])
             raise
+
+
+def _resolve_fetch_source(
+    repo: RepoRef,
+    number: int,
+    head_sha: str,
+    head: dict[str, Any],
+    base: dict[str, Any],
+) -> tuple[str, str]:
+    """PR 을 클론/체크아웃할 `(clone_url, fetch_ref)` 쌍을 안전하게 결정한다.
+
+    정상 케이스:
+        return (head.repo.clone_url, head_sha)
+    삭제된 fork 케이스 (head.repo == null 또는 clone_url 누락):
+        return (base.repo.clone_url, "refs/pull/{number}/head")
+
+    ### 왜 두 값을 같이 결정하는가
+
+    fork 가 삭제된 PR 에서 단순히 clone_url 만 base 로 바꾸면 여전히 `git fetch origin
+    {head_sha}` 는 실패한다 — head_sha 는 사라진 fork 에만 있던 객체일 수 있기 때문.
+    GitHub 은 base 저장소에 `refs/pull/{number}/head` 라는 virtual ref 를 유지해 PR 의
+    마지막 스냅샷을 노출하는데, 이를 통해 삭제된 fork 의 최종 PR 커밋도 받을 수 있다.
+
+    따라서 `clone_url` 을 base 로 바꾸는 순간 `fetch_ref` 도 동시에 `refs/pull/{n}/head`
+    로 바꿔야 실제 복구 경로가 된다. 둘이 짝이 되는 결정이라 한 함수에서 같이 반환한다
+    (codex PR #21 review #1 대응).
+
+    GitHub PR API 응답에서 `head["repo"]` 는 사용자가 fork 후 그 fork 를 **삭제한 경우
+    `null`** 로 온다. 인덱싱 시 TypeError 를 일으켜 fetch 통째로 실패하던 버그를 이
+    함수가 graceful fallback 으로 대체한다.
+
+    `repo` 와 `number` 는 fallback 발생 로그에 PR 식별자를 남기기 위해서만 사용.
+    """
+    head_repo = head.get("repo")
+    if isinstance(head_repo, dict):
+        clone_url = head_repo.get("clone_url")
+        if clone_url:
+            return str(clone_url), head_sha
+
+    base_clone_url = str(base["repo"]["clone_url"])
+    pr_ref = f"refs/pull/{number}/head"
+    logger.warning(
+        "PR %s#%d head.repo is missing or has no clone_url (likely deleted fork); "
+        "falling back to base.repo.clone_url with ref %s so the PR snapshot is still "
+        "fetchable via GitHub's PR refs",
+        repo.full_name,
+        number,
+        pr_ref,
+    )
+    return base_clone_url, pr_ref
 
 
 def _finding_to_comment(f: Finding) -> dict[str, object]:
