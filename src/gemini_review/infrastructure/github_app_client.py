@@ -131,6 +131,11 @@ class GitHubAppClient:
         # 재사용한다. 이렇게 하면 N 회 시도 시 `/pulls` 호출이 2N 회가 아니라 N+1 회로
         # 줄어든다 (gemini PR #19 review #1).
         pr_data: dict[str, Any] | None = None
+        # 마지막 시도에서 발생한 mid-pagination 예외 — 모든 시도 실패 후 RuntimeError 의
+        # cause 로 전파해 운영자가 "ABA 페이지 race" vs "fetch 시작-끝 SHA 변경" 을
+        # 구분할 수 있게 한다 (codex PR #19 review #4). 두 실패 모드는 디버깅 액션이
+        # 다르므로 같은 메시지로 묶이면 잘못된 진단을 유도.
+        last_mid_pagination_exc: _HeadShaChangedMidFetch | None = None
         for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
             if pr_data is None:
                 pr_data = self._request_object("GET", pr_url, auth=f"token {token}")
@@ -143,6 +148,7 @@ class GitHubAppClient:
             except _HeadShaChangedMidFetch as exc:
                 # 페이지네이션 도중 head_sha 가 움직였음 — 전체 fetch 재시도.
                 # 바깥 initial/rechecked 비교와 별도 (그건 fetch 시작-끝만 커버).
+                last_mid_pagination_exc = exc
                 if attempt < _MAX_FETCH_ATTEMPTS:
                     logger.warning(
                         "PR %s#%d head_sha changed mid-pagination (%s -> %s); "
@@ -210,10 +216,21 @@ class GitHubAppClient:
         # 지속적으로 force push 하고 있는 상태. 조용히 잘못된 데이터로 진행하기보다
         # 명시적으로 실패시켜 webhook 큐 자체에서 빼는 게 안전하다 (다음 push 의 새
         # webhook 이 새 시작점이 됨).
+        # 실패 모드를 메시지로 구분 (codex PR #19 review #4): 마지막 시도가 페이지네이션
+        # 중 ABA race 였다면 그 예외를 cause 로 chain 해 traceback 에 원인 노출. 그렇지
+        # 않으면 fetch 시작-끝 SHA 비교에서 실패한 케이스. 두 모드의 디버깅 액션이
+        # 다르므로 같은 메시지로 묶이면 운영자 진단을 잘못된 방향으로 유도한다.
+        if last_mid_pagination_exc is not None:
+            raise RuntimeError(
+                f"PR {repo.full_name}#{number} head_sha kept changing across "
+                f"{_MAX_FETCH_ATTEMPTS} attempts (last failure: mid-pagination ABA "
+                "during /files). Skipping; the next push webhook will retry."
+            ) from last_mid_pagination_exc
         raise RuntimeError(
             f"PR {repo.full_name}#{number} head_sha kept changing across "
-            f"{_MAX_FETCH_ATTEMPTS} attempts — possibly an active force-push "
-            "stream. Skipping this fetch; the next push webhook will retry."
+            f"{_MAX_FETCH_ATTEMPTS} attempts (last failure: fetch start/end SHA "
+            "mismatch — push between /pulls and /files). Skipping; the next push "
+            "webhook will retry."
         )
 
     def _fetch_files_for_pr(

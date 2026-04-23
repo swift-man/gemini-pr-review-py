@@ -747,11 +747,12 @@ def test_fetch_pull_request_raises_when_head_sha_keeps_changing(
     조용히 잘못된 데이터로 진행하는 것이 가장 위험한 실패 모드 — 차라리 webhook 큐
     수준에서 빼버리고 다음 push 의 새 webhook 이 새 시작점이 되도록 하는 게 안전.
 
-    회귀 방지: 마지막 시도에서 "retrying" 로그가 더 안 찍히는지도 함께 확인. 안 그러면
-    "retry 한다고 했는데 곧바로 실패" 라는 이상한 로그 흐름이 운영자를 혼란시킨다
-    (gemini PR #19 review #2). _MAX_FETCH_ATTEMPTS=3 이면 retry 로그는 최대 2건.
+    회귀 방지:
+    - 마지막 시도에서 "retrying" 로그가 더 안 찍히는지 (gemini PR #19 review #2)
+    - 실패 메시지가 fetch 시작-끝 모드임을 명시 (codex PR #19 review #4) — ABA 페이지
+      race 와 다른 디버깅 경로이므로 진단 메시지가 구분돼야
     """
-    # 매번 다른 SHA 를 돌려주는 시퀀스 — 어떤 시도도 안정되지 않음
+    # 매번 다른 SHA 를 돌려주는 시퀀스 — 어떤 시도도 안정되지 않음. 단일 페이지 PR.
     fake, _counters = _build_fake_urlopen_for_fetch_pr(
         head_shas=["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10"]
     )
@@ -760,15 +761,59 @@ def test_fetch_pull_request_raises_when_head_sha_keeps_changing(
 
     client = GitHubAppClient(app_id=1, private_key_pem="-")
     with caplog.at_level(logging.WARNING):
-        with pytest.raises(RuntimeError, match="head_sha kept changing"):
+        with pytest.raises(RuntimeError, match="head_sha kept changing") as exc_info:
             client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
 
+    # 진단 메시지: fetch 시작-끝 SHA 변동 (ABA 페이지 모드 아님). 단일 페이지 PR 이므로
+    # 페이지 사이 체크는 발동하지 않고, /pulls 시작-끝 비교에서만 실패.
+    assert "fetch start/end SHA mismatch" in str(exc_info.value)
+    # ABA cause 가 chain 되면 안 됨 (단일 페이지 PR 에선 mid-pagination 예외 미발생)
+    assert exc_info.value.__cause__ is None, (
+        "단일 페이지 PR 에선 mid-pagination 예외가 발생하지 않으므로 cause chain 도 없어야"
+    )
+
     # _MAX_FETCH_ATTEMPTS=3 → 1차·2차 mismatch 시 "retrying" 로그, 3차는 곧바로 raise.
-    # retry 로그는 정확히 2건 (3차에서 거짓 retry 메시지가 찍히면 회귀).
     retry_warns = [r for r in caplog.records if "retrying attempt" in r.getMessage()]
     assert len(retry_warns) == 2, (
         "마지막 시도에선 retry 로그가 찍히면 안 된다 — 곧바로 RuntimeError 로 빠진다"
     )
+
+
+def test_fetch_pull_request_chains_mid_pagination_cause_when_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ABA 페이지 race 가 매 시도마다 반복돼 exhaustion 으로 끝나면, 마지막 ABA
+    예외가 RuntimeError 의 `__cause__` 로 chain 되고 메시지에 mode 가 표기돼야 한다.
+
+    회귀 방지 (codex PR #19 review #4): mid-pagination 모드와 fetch 시작-끝 모드는
+    디버깅 액션이 다르다 — 전자는 페이지네이션 중간 체크 로직, 후자는 단일 시점 race.
+    같은 메시지로 묶이면 운영자가 잘못된 방향으로 진단을 시작할 수 있다.
+
+    시나리오: ABA 시퀀스를 반복해 모든 시도가 mid-pagination 에서 실패하도록 구성.
+    """
+    # 매 시도가 page=1 받고 between-page 체크에서 다른 SHA 발견 → ABA 발생.
+    # 시도 1: pulls=A, page=1, pulls=B (mismatch)
+    # 시도 2: pulls=B, page=1, pulls=C (mismatch)
+    # 시도 3: pulls=C, page=1, pulls=D (mismatch) → exhausted
+    fake, _counters = _build_fake_urlopen_paginated_aba(
+        sha_sequence=["A", "B", "B", "C", "C", "D", "D", "E"]
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    with pytest.raises(RuntimeError, match="head_sha kept changing") as exc_info:
+        client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # 메시지에 mid-pagination 모드 명시
+    assert "mid-pagination" in str(exc_info.value), (
+        "ABA exhaustion 케이스에선 메시지에 'mid-pagination' 이 들어가야 운영자가 "
+        "fetch 시작-끝 모드와 구분 가능"
+    )
+    # cause chain — 마지막 ABA 예외가 traceback 에 노출돼야 진단 정확도가 올라감
+    cause = exc_info.value.__cause__
+    assert cause is not None
+    assert "mid-pagination" in str(cause)
 
 
 def _build_fake_urlopen_paginated_aba(
