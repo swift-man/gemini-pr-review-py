@@ -25,6 +25,12 @@ def _default_tls_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=certifi.where())
 
 
+# fetch_pull_request 의 head_sha 일관성 재시도 한도. /pulls/{n} → /files 사이 push race
+# 가 발생했을 때 재시도. 2회까지 — 그 이상은 force push 폭주 시나리오로 보고 명시적
+# 실패시켜 운영자가 알아차리게 한다 (조용한 무한 retry 가 더 위험).
+_MAX_FETCH_ATTEMPTS = 3
+
+
 @dataclass(frozen=True)
 class _CachedToken:
     token: str
@@ -89,15 +95,74 @@ class GitHubAppClient:
     ) -> PullRequest:
         token = self.get_installation_token(installation_id)
         pr_url = f"{self._api_base}/repos/{repo.full_name}/pulls/{number}"
-        pr_data = self._request_object("GET", pr_url, auth=f"token {token}")
 
-        # /files 한 번 호출로 두 가지를 동시 수집:
-        #   1) changed_files 목록 (file_collector 우선순위 정렬용)
-        #   2) 각 파일의 patch → addable_lines 사전 파싱 (post_review 인라인 분할용)
-        # post_review 시점에 같은 호출을 다시 하면 그 사이 사용자가 push 한 새 커밋의
-        # patch 를 받게 돼 모델 finding 의 라인 번호와 불일치하는 race condition 이
-        # 발생함. head_sha 시점에 한 번만 fetch 해 PullRequest 에 캐싱하는 것이 핵심.
-        # per_page=100 은 GitHub 허용 최대치라 PR 이 큰 경우의 라운드트립 수를 최소화.
+        # ---- head_sha 일관성 재시도 루프 -----------------------------------
+        # PR #15 가 "post_review 가 /files 를 다시 부르는" 큰 race 를 닫았지만, 더 작은
+        # race 가 fetch_pull_request 안쪽에 남아 있다: GET /pulls/{n} 으로 head_sha 를
+        # 받고 GET /files 로 patch 를 받는 그 사이에도 사용자가 push 할 수 있다.
+        # 이 경우 PullRequest 에 박힌 head_sha 는 "옛 SHA" 인데 addable_lines/
+        # changed_files 는 "새 SHA" 의 것이라 라인 분할이 어긋난다.
+        # 해결: /files 끝낸 뒤 /pulls/{n} 을 다시 한 번 짚어 head_sha 가 그대로인지 확인.
+        # 변했다면 한 번 더 같은 SHA 로 다시 받도록 재시도. 무한 루프 회피를 위해
+        # _MAX_FETCH_ATTEMPTS 로 제한 — force-push 폭주는 운영자가 알아채야 한다.
+        for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+            pr_data = self._request_object("GET", pr_url, auth=f"token {token}")
+            initial_sha = str(pr_data["head"]["sha"])
+            changed, addable = self._fetch_files_for_pr(pr_url, token)
+
+            # /files 직후 head_sha 재확인. 같으면 그 SHA 의 일관된 스냅샷으로 확정.
+            recheck = self._request_object("GET", pr_url, auth=f"token {token}")
+            rechecked_sha = str(recheck["head"]["sha"])
+            if rechecked_sha == initial_sha:
+                head = pr_data["head"]
+                base = pr_data["base"]
+                return PullRequest(
+                    repo=repo,
+                    number=number,
+                    title=str(pr_data.get("title", "")),
+                    body=str(pr_data.get("body") or ""),
+                    head_sha=str(head["sha"]),
+                    head_ref=str(head["ref"]),
+                    base_sha=str(base["sha"]),
+                    base_ref=str(base["ref"]),
+                    clone_url=str(head["repo"]["clone_url"]),
+                    changed_files=tuple(changed),
+                    installation_id=installation_id,
+                    is_draft=bool(pr_data.get("draft", False)),
+                    addable_lines=tuple(addable),
+                )
+
+            logger.warning(
+                "PR %s#%d head_sha changed during fetch (%s -> %s); "
+                "retrying attempt %d/%d to get a consistent snapshot",
+                repo.full_name,
+                number,
+                initial_sha,
+                rechecked_sha,
+                attempt,
+                _MAX_FETCH_ATTEMPTS,
+            )
+
+        # 여기에 도달했다는 건 매 시도마다 head_sha 가 바뀌었다는 뜻 — 사용자가
+        # 지속적으로 force push 하고 있는 상태. 조용히 잘못된 데이터로 진행하기보다
+        # 명시적으로 실패시켜 webhook 큐 자체에서 빼는 게 안전하다 (다음 push 의 새
+        # webhook 이 새 시작점이 됨).
+        raise RuntimeError(
+            f"PR {repo.full_name}#{number} head_sha kept changing across "
+            f"{_MAX_FETCH_ATTEMPTS} attempts — possibly an active force-push "
+            "stream. Skipping this fetch; the next push webhook will retry."
+        )
+
+    def _fetch_files_for_pr(
+        self, pr_url: str, token: str
+    ) -> tuple[list[str], list[tuple[str, frozenset[int]]]]:
+        """`/pulls/{n}/files` 를 페이지네이션 끝까지 돌며 (changed, addable) 한 쌍을 만든다.
+
+        한 호출로 두 가지를 동시 수집:
+          1) changed_files 목록 (file_collector 우선순위 정렬용)
+          2) 각 파일의 patch → addable_lines 사전 파싱 (post_review 인라인 분할용)
+        per_page=100 은 GitHub 허용 최대치라 PR 이 큰 경우의 라운드트립 수를 최소화.
+        """
         files_url = f"{pr_url}/files?per_page=100"
         changed: list[str] = []
         addable: list[tuple[str, frozenset[int]]] = []
@@ -123,24 +188,7 @@ class GitHubAppClient:
             if len(files) < 100:
                 break
             page += 1
-
-        head = pr_data["head"]
-        base = pr_data["base"]
-        return PullRequest(
-            repo=repo,
-            number=number,
-            title=str(pr_data.get("title", "")),
-            body=str(pr_data.get("body") or ""),
-            head_sha=str(head["sha"]),
-            head_ref=str(head["ref"]),
-            base_sha=str(base["sha"]),
-            base_ref=str(base["ref"]),
-            clone_url=str(head["repo"]["clone_url"]),
-            changed_files=tuple(changed),
-            installation_id=installation_id,
-            is_draft=bool(pr_data.get("draft", False)),
-            addable_lines=tuple(addable),
-        )
+        return changed, addable
 
     def post_review(self, pr: PullRequest, result: ReviewResult) -> None:
         if self._dry_run:

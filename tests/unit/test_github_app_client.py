@@ -498,7 +498,8 @@ def test_fetch_pull_request_collects_addable_lines_with_single_files_call(
 
     회귀 방지: 이걸 두 번 나눠 호출하면 (1) 라운드트립 낭비 (2) race condition 위험
     (두 번째 호출이 새 head_sha 의 patch 를 받을 수 있음). 한 호출에서 함께 처리하는
-    것이 일관성 보장의 핵심.
+    것이 일관성 보장의 핵심. (/pulls 는 head_sha 일관성 재확인 때문에 2회 호출됨 —
+    별도의 race 테스트에서 검증.)
     """
     files_call_count = 0
 
@@ -532,7 +533,7 @@ def test_fetch_pull_request_collects_addable_lines_with_single_files_call(
     client = GitHubAppClient(app_id=1, private_key_pem="-")
     pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
 
-    # 단일 호출 — 두 번 부르면 race condition 위험
+    # 단일 /files 호출 — 두 번 부르면 race condition 위험
     assert files_call_count == 1
 
     # changed_files 와 addable_lines 모두 채워졌어야
@@ -541,6 +542,124 @@ def test_fetch_pull_request_collects_addable_lines_with_single_files_call(
     assert addable["src/a.py"] == frozenset({5, 6})
     # binary 파일은 patch=None → 빈 frozenset (보수적)
     assert addable["binary.png"] == frozenset()
+
+
+def _build_fake_urlopen_for_fetch_pr(
+    *,
+    head_shas: list[str],
+    files_payload: bytes = b'[{"filename": "src/a.py", "patch": "@@ -1,0 +5,2 @@\\n+x\\n+y\\n"}]',
+    counters: dict[str, int] | None = None,
+):
+    """fetch_pull_request race-condition 테스트용 urlopen 빌더.
+
+    `head_shas` 는 `/pulls/{n}` 호출이 매번 어떤 head_sha 를 반환할지 순서대로 지정.
+    반복 시 마지막 값을 계속 사용 (테스트가 시도 횟수보다 짧은 리스트를 줘도 안전).
+    """
+    if counters is None:
+        counters = {"pulls": 0, "files": 0}
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        if "/files" in req.full_url:
+            counters["files"] += 1
+            return _FakeResponse(files_payload)
+        # /pulls/{n} 메타데이터 — head_sha 만 시퀀스에 따라 바꾸고 나머진 고정
+        idx = min(counters["pulls"], len(head_shas) - 1)
+        sha = head_shas[idx]
+        counters["pulls"] += 1
+        return _FakeResponse(json.dumps({
+            "title": "t",
+            "body": "b",
+            "draft": False,
+            "head": {"sha": sha, "ref": "feat", "repo": {"clone_url": "https://x.git"}},
+            "base": {"sha": "def", "ref": "main"},
+        }).encode())
+
+    return fake_urlopen, counters
+
+
+def test_fetch_pull_request_rechecks_head_sha_after_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`/files` 직후 `/pulls/{n}` 을 다시 짚어 head_sha 가 그대로인지 확인해야 한다.
+
+    회귀 방지: 이 재확인이 빠지면 `/pulls/{n}` 과 `/files` 사이 사용자가 push 한
+    경우 head_sha 는 옛 SHA, addable_lines 는 새 SHA 의 것이라 라인 분할이 어긋나
+    잘못된 위치에 인라인 코멘트가 붙는다.
+    """
+    fake, counters = _build_fake_urlopen_for_fetch_pr(head_shas=["abc"])
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # /pulls/{n} 를 두 번 짚어야 (앞: head_sha 확보, 뒤: 일관성 재확인)
+    assert counters["pulls"] == 2, "head_sha 일관성 재확인 호출이 누락됐다"
+    assert counters["files"] == 1, "정상 케이스에선 /files 가 한 번만 호출돼야 한다"
+    assert pr.head_sha == "abc"
+
+
+def test_fetch_pull_request_retries_when_head_sha_changes_mid_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`/pulls/{n}` 과 `/files` 사이 head_sha 가 바뀌면 한 번 재시도해 일관된 스냅샷을 얻어야 한다.
+
+    회귀 방지: 재시도 로직이 빠지면 첫 시도의 어긋난 데이터를 그대로 PullRequest 에
+    박아 후속 인라인 분할이 깨진다. 두 번째 시도에서 head_sha 가 안정되면 그 SHA 의
+    일관된 스냅샷으로 정상 반환해야 한다.
+    """
+    import logging
+
+    # 1차: pulls=abc → files → pulls=def (변경 감지) ⇒ 재시도
+    # 2차: pulls=def → files → pulls=def (안정) ⇒ 확정
+    fake, counters = _build_fake_urlopen_for_fetch_pr(
+        head_shas=["abc", "def", "def", "def"]
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    with caplog.at_level(logging.WARNING):
+        pr = client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
+
+    # /pulls 4번 (1차: 2 + 2차: 2), /files 2번 (1차 1 + 2차 1)
+    assert counters["pulls"] == 4
+    assert counters["files"] == 2
+    # 두 번째 시도의 안정된 SHA 가 박혀야 한다
+    assert pr.head_sha == "def"
+
+    # WARN 로그가 운영 관측 — race 가 일어났음을 운영자가 알 수 있어야
+    warns = [r for r in caplog.records if "head_sha changed" in r.getMessage()]
+    assert len(warns) == 1, "head_sha race 발생 시 WARN 한 줄이 남아야 한다"
+    assert "abc" in warns[0].getMessage() and "def" in warns[0].getMessage()
+
+
+def test_fetch_pull_request_raises_when_head_sha_keeps_changing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """매 시도마다 head_sha 가 바뀌면(force-push 폭주) 무한 retry 대신 명시적 실패.
+
+    조용히 잘못된 데이터로 진행하는 것이 가장 위험한 실패 모드 — 차라리 webhook 큐
+    수준에서 빼버리고 다음 push 의 새 webhook 이 새 시작점이 되도록 하는 게 안전.
+    """
+    # 매번 다른 SHA 를 돌려주는 시퀀스 — 어떤 시도도 안정되지 않음
+    fake, _counters = _build_fake_urlopen_for_fetch_pr(
+        head_shas=["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10"]
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    with pytest.raises(RuntimeError, match="head_sha kept changing"):
+        client.fetch_pull_request(RepoRef("o", "r"), 9, installation_id=7)
 
 
 def test_http_attaches_response_detail_to_httperror(
