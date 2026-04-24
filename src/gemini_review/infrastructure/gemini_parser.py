@@ -58,9 +58,28 @@ def parse_review(
     """
     payload = _extract_json(raw)
     if payload is None:
-        logger.warning("gemini output did not contain JSON; falling back to plain text")
+        # **보안 주의** (codex PR #24 review #1+#2): raw 응답에는 모델 입력으로 들어간 PR
+        # 전체 코드베이스의 일부가 echo 될 수 있다 (예: 시크릿이 포함된 .env, 인증 정보가
+        # 박힌 config). 이런 raw 본문이 (1) 외부 로그 수집기로, (2) GitHub 게시 본문으로
+        # 새는 두 경로를 모두 차단:
+        #   - 로그: 길이·비어있음 메타만 기록
+        #   - 게시 본문: 안전한 고정 안내 + 같은 메타만. raw 본문은 어디에도 노출 X.
+        # 진단의 자세한 내용은 모델 측 로그·운영 모니터링으로 별도 조사. 빈 stdout 이라면
+        # 엔진의 빈-출력 가드 (fallback chain) 가 먼저 잡았어야 — 여기까지 도달한 raw 의
+        # 길이가 0 이면 그 가드가 빠진 회귀.
+        logger.warning(
+            "gemini output did not contain JSON; falling back to plain text "
+            "(raw_length=%d, non_empty=%s). raw content NOT logged for security.",
+            len(raw),
+            bool(raw.strip()),
+        )
         return ReviewResult(
-            summary=raw.strip()[:4000] or "Gemini 응답을 파싱하지 못했습니다.",
+            summary=(
+                "Gemini 응답을 JSON 으로 파싱하지 못했습니다. "
+                f"(raw_length={len(raw)}, non_empty={bool(raw.strip())}) "
+                "응답 본문에 코드·시크릿이 포함될 위험으로 raw 본문은 게시하지 않습니다. "
+                "다음 push 가 새 리뷰를 트리거할 때까지 대기하거나 운영자에게 문의하세요."
+            ),
             event=ReviewEvent.COMMENT,
         )
 

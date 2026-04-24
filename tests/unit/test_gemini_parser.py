@@ -56,10 +56,59 @@ def test_parse_picks_last_valid_json_when_reasoning_precedes() -> None:
     assert result.event == ReviewEvent.REQUEST_CHANGES
 
 
-def test_parse_fallbacks_to_plain_text_when_no_json() -> None:
-    result = parse_review("그냥 평문 응답입니다.")
-    assert "평문" in result.summary
+def test_parse_fallbacks_to_safe_summary_when_no_json() -> None:
+    """JSON 추출 실패 시 summary 는 안전한 고정 안내 + 메타만 — raw 본문은 노출 안 됨.
+
+    회귀 방지 (codex PR #24 review #2, 보안): 이전엔 raw 응답 4000 자를 summary 에 그대로
+    실어 GitHub 본문으로 게시. 모델이 프롬프트의 코드/시크릿 echo 하면 외부 게시 경로로
+    유출. 안전한 고정 문구 + 길이·비어있음 메타로 대체.
+    """
+    raw = "그냥 평문 응답입니다."
+    result = parse_review(raw)
+
+    # 안전한 고정 안내 문구
+    assert "JSON" in result.summary
+    assert "파싱하지 못했습니다" in result.summary
+    # raw 본문은 summary 에 노출 안 됨
+    assert "평문 응답입니다" not in result.summary
+    # 진단 메타는 노출 (운영자 모니터링 용)
+    assert "raw_length=" in result.summary
+    assert "non_empty=" in result.summary
     assert result.event == ReviewEvent.COMMENT
+
+
+def test_parse_fallback_does_not_leak_raw_to_log_or_summary(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """JSON 추출 실패 시 raw 응답 내용은 로그에도 게시 본문에도 절대 노출되지 않아야 한다.
+
+    회귀 방지 (codex PR #24 review #1+#2, 보안): raw 응답에는 모델 입력으로 들어간 PR
+    전체 코드베이스의 일부가 echo 될 수 있다. 시크릿 (.env, config) 도 두 경로로 유출
+    가능:
+    - 외부 로그 수집기 (review #1, 이전 commit 에서 처리)
+    - GitHub 리뷰 본문 (review #2, 이번 commit 에서 처리)
+
+    두 경로 모두 막혀야 same regression 이 다시 양쪽에서 안 일어남.
+    """
+    secret_marker = "MY_SECRET_TOKEN_DO_NOT_LEAK"
+    raw = f"평문 응답 with hidden {secret_marker} embedded"
+
+    with caplog.at_level(logging.WARNING):
+        result = parse_review(raw)
+
+    # 1) 게시 본문 (summary) 에 secret 이 새면 안 됨
+    assert secret_marker not in result.summary, (
+        "raw 응답이 ReviewResult.summary 에 노출됨 — GitHub 본문 게시 경로로 시크릿 유출"
+    )
+    # 2) 로그에도 secret 이 새면 안 됨
+    log_text = " | ".join(r.getMessage() for r in caplog.records)
+    assert secret_marker not in log_text, (
+        "raw 응답이 WARN 로그에 노출됨 — 외부 로그 수집기로 시크릿 유출"
+    )
+    # 진단 메타는 양쪽 다 노출돼야 (운영 진단 가능)
+    assert "raw_length=" in log_text
+    assert "non_empty=" in log_text
+    assert "raw_length=" in result.summary
 
 
 def test_parse_drops_findings_without_valid_line() -> None:

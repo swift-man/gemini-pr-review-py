@@ -151,6 +151,32 @@ class GeminiCliEngine:
                 continue
 
             if result.returncode == 0:
+                # 빈 stdout 은 "성공인데 무응답" 이라는 모순 상태. 실관측: gemini-3.1-pro-preview
+                # 가 일부 PR (예: mlx-pr-review-py#31) 에 returncode=0 + 완전 빈 stdout 으로
+                # 응답. 그대로 파서에 넘기면 빈 ReviewResult 가 만들어져 "Gemini 응답을
+                # 파싱하지 못했습니다." 라는 무의미한 리뷰가 GitHub 에 게시됨. fallback 체인을
+                # 태워 다음 모델이 실제 응답을 줄 기회를 만든다.
+                if not result.stdout.strip():
+                    last_error = "empty stdout (model returned no content)"
+                    if has_fallback:
+                        fallback = models[index + 1]
+                        logger.warning(
+                            "gemini %s returned empty stdout (returncode=0); "
+                            "falling back to %s",
+                            model,
+                            fallback,
+                        )
+                        continue
+                    # 진단 보강 (codex PR #24 review): 마지막 모델명과 stderr preview 를
+                    # 메시지에 포함해 운영자가 어떤 모델이 마지막에 실패했고 그 시점의
+                    # 부가 정보 (예: 토큰 한도 도달 메시지) 가 무엇이었는지 즉시 확인 가능.
+                    # stderr 는 보통 진단 정보 (모델 상태/에러) 를 담아 시크릿 위험은 낮지만
+                    # preview 길이는 200 자로 제한해 만일의 누출 표면 줄임.
+                    stderr_preview = (result.stderr or "").strip()[:200]
+                    raise RuntimeError(
+                        f"gemini -p returned empty stdout on all {len(models)} model(s); "
+                        f"last_model={model}, stderr_preview={stderr_preview!r}"
+                    )
                 # `parse_review` 는 CLI 출력만 해석하므로 어느 모델이 이 결과를 만들었는지
                 # 모른다. 여기서 한 번에 주입해서 fallback 발동 시 운영자가 본문 푸터로
                 # 실제 사용 모델을 바로 확인할 수 있게 한다.
