@@ -35,10 +35,12 @@ GitHub PR event
 ```
 src/gemini_review/
 ├── interfaces/       # Protocol: GitHubClient, ReviewEngine, RepoFetcher, FileCollector,
-│                     #            FindingVerifier (출처 기반 환각 후처리 검증)
-├── domain/           # PullRequest, ReviewResult, Finding, FileDump (frozen dataclass)
+│                     #            FindingVerifier (출처 grounding),
+│                     #            FindingDeduper (history grounding)
+├── domain/           # PullRequest, ReviewResult, Finding, FileDump,
+│                     #  PostedReviewComment (frozen dataclass)
 ├── application/
-│   ├── review_pr_use_case.py   # 오케스트레이션 (verify 단계 포함)
+│   ├── review_pr_use_case.py   # 오케스트레이션 (verify → dedupe 단계 포함)
 │   └── webhook_handler.py      # HMAC 검증 + 직렬화 큐 워커
 ├── infrastructure/
 │   ├── github_app_client.py                # JWT → installation token → REST
@@ -47,7 +49,8 @@ src/gemini_review/
 │   ├── gemini_prompt.py                    # 한국어 시스템 규칙 + 파일 직렬화
 │   ├── gemini_parser.py                    # JSON 추출 (코드펜스 스트립) + fallback
 │   ├── gemini_cli_engine.py                # subprocess(gemini -p) 호출 + OAuth 선점검
-│   └── source_grounded_finding_verifier.py # 환각 phantom-quote 후처리 강등 (출처 grounding)
+│   ├── source_grounded_finding_verifier.py # Layer B: phantom-quote 출처 grounding 강등
+│   └── cross_pr_finding_deduper.py         # Layer D: 이전 push 와 중복 finding history 강등
 ├── config.py         # pydantic-settings
 └── main.py           # FastAPI 조립 (DI)
 ```
@@ -167,22 +170,28 @@ REPO_FULL_NAME=owner/repo PR_NUMBER=1 INSTALLATION_ID=1234567 \
 
 모두 `src/gemini_review/infrastructure/gemini_prompt.py`에서 조정 가능합니다.
 
-## 환각 방어 — 출처 기반 후처리 검증
+## 환각 방어 — 다층 후처리
 
 대규모 모델은 동일 PR 의 연속 push 에 대해 같은 위치에 phantom whitespace/오타 같은 거짓
 인용을 반복 보고하는 경향이 있습니다 (예: 실제 코드는 `"@scope"` 인데 모델이 `" @scope"`
-앞에 공백이 있다고 단언). 본 봇은 이를 **2 단계** 로 방어합니다.
+앞에 공백이 있다고 단언). 본 봇은 이를 **3 단계** 로 방어합니다.
 
-1. **프롬프트 가이드** — `gemini_prompt.py` 의 "Phantom 공백·오타 환각" 섹션이 모델에게
-   인용한 텍스트가 실제 라인에 그대로 있는지 재확인하도록 강하게 지시합니다.
-2. **출처 기반 후처리 검증** — `infrastructure/source_grounded_finding_verifier.py` 의
+1. **프롬프트 가이드 (Layer C)** — `gemini_prompt.py` 의 "Phantom 공백·오타 환각" 섹션이
+   모델에게 인용한 텍스트가 실제 라인에 그대로 있는지 재확인하도록 강하게 지시합니다.
+2. **출처 grounding (Layer B)** — `infrastructure/source_grounded_finding_verifier.py` 의
    `SourceGroundedFindingVerifier` 가 모델 응답을 받은 뒤, `[Critical]/[Major]` 본문에
    "공백·띄어쓰기·오타 / whitespace·spacing·typo" 같은 단언 키워드가 있고 backtick 인용
    substring 이 있을 때 체크아웃된 실제 라인과 대조해 **모든 인용이 일치하지 않으면**
-   `[Suggestion]` 으로 강등합니다 (strict-only 정책). 강등이 발생하면 `event` 도
-   `_normalize_event` 가 재정합합니다.
+   `[Suggestion]` 으로 강등합니다 (strict-only 정책).
+3. **History grounding (Layer D)** — `infrastructure/cross_pr_finding_deduper.py` 의
+   `CrossPrFindingDeduper` 가 같은 PR 의 이전 push 에서 본 봇이 게시한 인라인 코멘트를
+   GitHub API 로 조회해, 새 `[Critical]/[Major]` finding 이 동일 `(path, line, severity-stripped
+   body)` 로 다시 등장하면 `[Suggestion]` 으로 강등합니다. "이전 push 에서 메인테이너가
+   무시한 신호" 로 보고 alert fatigue 차단.
 
-### Strict-only 정책의 의도된 trade-off
+강등이 발생하면 `event` 도 `_normalize_event` 가 재정합합니다 (Layer B/D 공통).
+
+### Strict-only 정책 (Layer B) 의 의도된 trade-off
 
 `[Critical] 공백 오타: 'usrname' → 'username' 으로 수정하세요` 처럼 **현재값** 과
 **수정안** 을 둘 다 backtick 으로 인용하는 정상 오타 지적도 strict 매칭에선 강등됩니다
@@ -191,6 +200,19 @@ REPO_FULL_NAME=owner/repo PR_NUMBER=1 INSTALLATION_ID=1234567 \
 하다는 결론에 따라 strict-only 로 단순화했습니다 — false positive (정당 finding 강등)
 비용을 받아들이고 phantom 차단을 우선합니다. 강등된 finding 도 본문/원래 등급은 보존돼
 PR 작성자가 직접 판단할 수 있습니다.
+
+### Exact-match 정책 (Layer D) 의 의도된 trade-off
+
+dedup 시그니처는 `(path, line, severity-prefix-stripped body 의 strip 결과)` 정확 매칭.
+- 등급만 바꾼 본문 (`[Critical]` → `[Major]`) 은 dedup 발동 (의도된 강등 — 모델의 등급
+  흔들기 우회 차단).
+- 단어 한 글자 다른 본문은 dedup 안 됨 (의도된 보수 — 퍼지 매칭은 정당한 별개 finding
+  까지 묶을 위험).
+- API 호출 실패 (네트워크/auth/rate-limit) 시 graceful degrade — dedup 만 잠시 작동하지
+  않고 리뷰 게시는 진행. dedup 부재의 비용 (alert fatigue 일시 재현) < 리뷰 게시 실패 비용.
+
+dedup 의 식별 기준은 `performed_via_github_app.id == settings.github_app_id` — 봇 이름 변경
+에 강건하고 사람·다른 봇의 코멘트는 자동 제외됩니다.
 
 ## 테스트
 

@@ -11,7 +11,14 @@ from typing import Any
 import certifi
 import jwt
 
-from gemini_review.domain import Finding, PullRequest, RepoRef, ReviewEvent, ReviewResult
+from gemini_review.domain import (
+    Finding,
+    PostedReviewComment,
+    PullRequest,
+    RepoRef,
+    ReviewEvent,
+    ReviewResult,
+)
 
 from .diff_parser import addable_lines_from_patch
 
@@ -389,6 +396,65 @@ class GitHubAppClient:
         url = f"{self._api_base}/repos/{pr.repo.full_name}/issues/{pr.number}/comments"
         self._request_object("POST", url, auth=f"token {token}", body={"body": body})
 
+    def list_self_review_comments(
+        self, pr: PullRequest
+    ) -> tuple[PostedReviewComment, ...]:
+        """본 GitHub App 이 PR 에 게시한 라인 고정 인라인 리뷰 코멘트 목록.
+
+        ### 식별 기준 — `performed_via_github_app.id == self._app_id`
+
+        `user.login` 으로 필터링은 봇 이름 변경에 깨지지만 App ID 는 안정. GitHub
+        REST 응답에서 봇이 게시한 코멘트는 `performed_via_github_app` 객체에 App
+        식별 메타를 담고 있다. 사람이 게시한 코멘트, 다른 봇 (codex, mlx 등) 의
+        코멘트는 자동 제외돼 본 봇의 history grounding 만 비교 대상이 된다.
+
+        ### 제외 케이스 — outdated 코멘트 (`line == null`)
+
+        force-push 후 anchor 가 사라진 코멘트는 GitHub 가 `line=null`, `original_line=N`
+        형태로 보존한다. 라인 매칭 dedup 의 key 로 쓸 수 없으므로 인프라 레벨에서
+        드롭. `original_line` 으로 fallback 하면 유저가 의도적으로 코드를 옮긴 경우
+        가짜 dedup 발동 — 보수적으로 제외.
+
+        ### 페이지네이션 — 최신순 + 1000 cap (codex PR #25 review #2)
+
+        GitHub `/pulls/{n}/comments` 의 기본 정렬은 `created` ASC (오래된 순). 그대로
+        `_fetch_files_for_pr` 패턴으로 100 × 10 페이지 cap 을 적용하면 1000 코멘트가
+        쌓인 장기 PR 의 **최신** 코멘트가 cap 밖으로 밀려나 dedup history 에서 누락 →
+        직전 push 의 finding 도 못 잡는 회귀.
+
+        해결: `sort=created&direction=desc` 로 최신부터 페이지네이션. cap 안에서도 가장
+        최근 1000 코멘트를 우선 보장. dedup 의 주된 비교 대상은 직전 push 들의 코멘트
+        이므로 최신 1000 만으로 실용 충족 (그 이상 오래된 동일 finding 은 이미 모델 본문
+        도 표현이 바뀌어 정확 매칭 확률이 낮음).
+
+        cap 도달 시 WARN — 그 이상이면 운영 이상 신호 (또는 매우 활발한 장기 PR).
+        """
+        token = self.get_installation_token(pr.installation_id)
+        comments_url = (
+            f"{self._api_base}/repos/{pr.repo.full_name}/pulls/{pr.number}/comments"
+            f"?per_page=100&sort=created&direction=desc"
+        )
+        results: list[PostedReviewComment] = []
+        page = 1
+        while page <= 10:
+            entries = self._request_list(
+                "GET", f"{comments_url}&page={page}", auth=f"token {token}"
+            )
+            for entry in entries:
+                mapped = _map_review_comment(entry, app_id=self._app_id)
+                if mapped is not None:
+                    results.append(mapped)
+            if len(entries) < 100:
+                return tuple(results)
+            page += 1
+        logger.warning(
+            "list_self_review_comments capped at 10 pages for %s#%d (>=1000 comments); "
+            "dedup may be incomplete",
+            pr.repo.full_name,
+            pr.number,
+        )
+        return tuple(results)
+
     # --- HTTP ---------------------------------------------------------------
     #
     # `_http` 는 인증·직렬화·HTTPError 로깅만 책임지는 저수준 원시 호출. 반환 타입은
@@ -521,6 +587,35 @@ def _resolve_fetch_source(
 
 def _finding_to_comment(f: Finding) -> dict[str, object]:
     return {"path": f.path, "line": f.line, "side": "RIGHT", "body": f.body}
+
+
+def _map_review_comment(
+    entry: dict[str, Any], *, app_id: int
+) -> PostedReviewComment | None:
+    """GitHub `/pulls/{n}/comments` 응답 한 건을 도메인 객체로 매핑하거나 None 으로 드롭.
+
+    드롭 조건 (모두 dedup 시그니처로 부적합한 케이스):
+      - 본 App 이 게시한 게 아님 (`performed_via_github_app.id != app_id`)
+      - line anchor 가 깨졌음 (`line is None` — force-push 후 outdated)
+      - path/body 누락 — GitHub 응답 결손, dedup key 형성 불가
+
+    이 함수가 None 을 반환하는 모든 경로는 의도된 안전한 제외 — 호출자에 별도 신호
+    필요 없음. 잘못 매핑되어 false dedup 이 발동하는 것보다 dedup 이 동작하지 않는
+    편이 안전 (Layer D 는 방어 레이어).
+    """
+    via = entry.get("performed_via_github_app")
+    if not isinstance(via, dict):
+        return None
+    if via.get("id") != app_id:
+        return None
+    line = entry.get("line")
+    if not isinstance(line, int):
+        return None
+    path = entry.get("path")
+    body = entry.get("body")
+    if not isinstance(path, str) or not isinstance(body, str):
+        return None
+    return PostedReviewComment(path=path, line=line, body=body)
 
 
 def _partition_findings(

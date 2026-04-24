@@ -1205,3 +1205,200 @@ def test_http_attaches_response_detail_to_httperror(
     assert detail is not None, "HTTPError 에 응답 본문이 첨부돼야 한다"
     assert "Validation Failed" in detail
     assert "foo" in detail
+
+
+# --- list_self_review_comments (Layer D 의 history grounding 데이터 소스) ---
+
+
+def _comments_response(items: list[dict[str, Any]]) -> bytes:
+    return json.dumps(items).encode()
+
+
+def _make_fake_comments_urlopen(pages: list[list[dict[str, Any]]]):
+    """`/pulls/{n}/comments?page=K` 흐름을 시뮬레이션하는 urlopen 대체.
+
+    - access_tokens: 정상 토큰 응답
+    - /pulls/{n}/comments?page=K: pages[K-1] 반환 (없으면 빈 배열)
+    """
+    seen_pages: list[int] = []
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        # parse page= from query string
+        page_str = req.full_url.split("page=")[-1]
+        page = int(page_str)
+        seen_pages.append(page)
+        if page <= len(pages):
+            return _FakeResponse(_comments_response(pages[page - 1]))
+        return _FakeResponse(_comments_response([]))
+
+    return fake_urlopen, seen_pages
+
+
+def test_list_self_review_comments_filters_by_app_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """본 App 의 코멘트만 통과 — 사람·다른 봇 제외.
+
+    회귀 방지: dedup 의 의미는 "본 봇이 무시되는 신호". `user.login` 기반 필터는 봇
+    이름 변경에 깨지므로 `performed_via_github_app.id` 를 1차 신호로 사용. 이 테스트는
+    OUR_APP_ID 와 다른 ID, 사람 코멘트, performed_via_github_app 누락 (사람 코멘트의
+    표준 형태) 을 모두 제외함을 lock.
+    """
+    OUR_APP_ID = 1234
+    OTHER_APP_ID = 9999
+    pages = [
+        [
+            {
+                "path": "a.py",
+                "line": 10,
+                "body": "[Major] 본 봇이 게시.",
+                "performed_via_github_app": {"id": OUR_APP_ID, "name": "gemini-pr-review-bot"},
+            },
+            {
+                "path": "a.py",
+                "line": 20,
+                "body": "[Critical] 다른 봇 (codex) 의 코멘트.",
+                "performed_via_github_app": {"id": OTHER_APP_ID, "name": "codex-review-bot"},
+            },
+            {
+                "path": "a.py",
+                "line": 30,
+                "body": "사람이 단 코멘트.",
+                # performed_via_github_app 키 자체 누락 = 사람 코멘트의 일반적 형태
+            },
+        ]
+    ]
+    fake, _ = _make_fake_comments_urlopen(pages)
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=OUR_APP_ID, private_key_pem="-")
+    out = client.list_self_review_comments(_sample_pr())
+
+    assert len(out) == 1, "본 봇 (OUR_APP_ID) 의 코멘트만 살아남아야"
+    assert out[0].path == "a.py" and out[0].line == 10
+    assert out[0].body.startswith("[Major]")
+
+
+def test_list_self_review_comments_skips_outdated_with_null_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """force-push 후 anchor 깨진 outdated 코멘트 (`line: null`) 는 드롭.
+
+    회귀 방지: line=null 인 코멘트는 dedup key 형성 불가. original_line 으로 fallback
+    하면 유저가 의도적으로 코드를 옮긴 경우 가짜 dedup 발동 — 보수적으로 제외.
+    """
+    OUR_APP_ID = 1234
+    pages = [
+        [
+            {
+                "path": "a.py",
+                "line": None,  # outdated
+                "original_line": 10,  # GitHub 가 보존하지만 우리는 안 씀
+                "body": "[Major] outdated.",
+                "performed_via_github_app": {"id": OUR_APP_ID},
+            },
+            {
+                "path": "a.py",
+                "line": 25,
+                "body": "[Major] 살아 있는 코멘트.",
+                "performed_via_github_app": {"id": OUR_APP_ID},
+            },
+        ]
+    ]
+    fake, _ = _make_fake_comments_urlopen(pages)
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=OUR_APP_ID, private_key_pem="-")
+    out = client.list_self_review_comments(_sample_pr())
+
+    assert len(out) == 1, "line=null 은 드롭, line=int 만 통과"
+    assert out[0].line == 25
+
+
+def test_list_self_review_comments_paginates_until_short_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """100 + 50 응답 → 두 페이지 fetch, 50건 페이지에서 종료.
+
+    회귀 방지: 단일 페이지 가정으로 코드를 단순화하면 큰 PR 에서 오래된 코멘트가
+    history 에서 누락돼 dedup 미발동. _fetch_files_for_pr 와 동일 패턴 사용.
+    """
+    OUR_APP_ID = 1234
+    page1 = [
+        {
+            "path": "a.py",
+            "line": i,
+            "body": f"[Major] page1 #{i}.",
+            "performed_via_github_app": {"id": OUR_APP_ID},
+        }
+        for i in range(1, 101)
+    ]
+    page2 = [
+        {
+            "path": "b.py",
+            "line": i,
+            "body": f"[Major] page2 #{i}.",
+            "performed_via_github_app": {"id": OUR_APP_ID},
+        }
+        for i in range(1, 51)
+    ]
+    fake, seen_pages = _make_fake_comments_urlopen([page1, page2])
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=OUR_APP_ID, private_key_pem="-")
+    out = client.list_self_review_comments(_sample_pr())
+
+    assert seen_pages == [1, 2], "100건 첫 페이지 → 2페이지 추가 fetch, 50건 → 종료"
+    assert len(out) == 150, "두 페이지 합쳐 150건"
+
+
+def test_list_self_review_comments_uses_newest_first_sort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`/pulls/{n}/comments` 호출 URL 에 `sort=created&direction=desc` 가 포함돼야 한다.
+
+    회귀 방지 (codex PR #25 review #2): GitHub 기본 정렬은 `created` ASC (오래된 순).
+    그대로 두면 1000+ 코멘트가 쌓인 장기 PR 의 최신 코멘트가 10-page cap 밖으로 밀려나
+    dedup 무력화 — Layer D 의 주된 dedup 대상인 직전 push 코멘트도 못 잡는 회귀.
+
+    `direction=desc` 보장이 깨지면 cap 안에서 최신 코멘트가 누락될 수 있으므로 URL 자체에
+    파라미터가 반드시 들어가야 한다는 invariant 를 lock.
+    """
+    OUR_APP_ID = 1234
+    captured_urls: list[str] = []
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        captured_urls.append(req.full_url)
+        return _FakeResponse(b"[]")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=OUR_APP_ID, private_key_pem="-")
+    client.list_self_review_comments(_sample_pr())
+
+    assert len(captured_urls) >= 1, "코멘트 endpoint 가 호출돼야"
+    url = captured_urls[0]
+    assert "sort=created" in url, (
+        f"sort=created 가 빠지면 GitHub 기본 ASC 정렬로 cap 밖 누락. URL: {url}"
+    )
+    assert "direction=desc" in url, (
+        f"direction=desc 가 빠지면 최신 코멘트 우선 보장 깨짐. URL: {url}"
+    )

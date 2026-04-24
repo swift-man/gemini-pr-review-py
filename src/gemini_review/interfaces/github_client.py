@@ -1,6 +1,6 @@
 from typing import Protocol
 
-from gemini_review.domain import PullRequest, RepoRef, ReviewResult
+from gemini_review.domain import PostedReviewComment, PullRequest, RepoRef, ReviewResult
 
 
 class GitHubClient(Protocol):
@@ -30,6 +30,21 @@ class GitHubClient(Protocol):
         body: str,
     ) -> None:
         """PR 에 단순 이슈 코멘트를 게시합니다. 예산 초과 안내 등에 사용합니다."""
+        ...
+
+    def list_self_review_comments(
+        self, pr: PullRequest
+    ) -> tuple[PostedReviewComment, ...]:
+        """본 GitHub App 이 이전에 PR 에 게시한 라인 고정 인라인 리뷰 코멘트 목록을 반환합니다.
+
+        Layer D (cross-PR finding dedup) 가 같은 PR 의 이전 push 에서 본 봇이 직접
+        게시했던 코멘트를 dedup key 로 쓰기 위해 사용. 다른 사람·다른 봇의 코멘트는
+        제외해야 의미 있는 비교가 됨 — 본 봇이 무시되는지를 봐야 하는 신호이므로.
+
+        식별 기준은 `performed_via_github_app.id == self._app_id` (봇 이름 변경에 강건).
+        force-push 로 anchor 가 깨진 outdated 코멘트(`line == null`) 는 제외 — 라인
+        매칭 dedup 에 쓸 수 없음.
+        """
         ...
 
     def get_installation_token(self, installation_id: int) -> str:

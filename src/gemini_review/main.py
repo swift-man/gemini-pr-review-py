@@ -8,6 +8,7 @@ from fastapi import FastAPI, Request, Response
 from gemini_review.application.review_pr_use_case import ReviewPullRequestUseCase
 from gemini_review.application.webhook_handler import WebhookHandler
 from gemini_review.config import Settings
+from gemini_review.infrastructure.cross_pr_finding_deduper import CrossPrFindingDeduper
 from gemini_review.infrastructure.file_dump_collector import FileDumpCollector
 from gemini_review.infrastructure.gemini_cli_engine import GeminiAuthError, GeminiCliEngine
 from gemini_review.infrastructure.git_repo_fetcher import GitRepoFetcher
@@ -56,6 +57,7 @@ def build_handler(settings: Settings) -> WebhookHandler:
         file_collector=collector,
         engine=engine,
         finding_verifier=SourceGroundedFindingVerifier(),
+        finding_deduper=CrossPrFindingDeduper(github=github),
         max_input_tokens=settings.gemini_max_input_tokens,
     )
     return WebhookHandler(

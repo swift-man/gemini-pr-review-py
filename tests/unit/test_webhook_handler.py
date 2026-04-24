@@ -15,6 +15,7 @@ from gemini_review.application.webhook_handler import WebhookHandler
 from gemini_review.domain import (
     FileDump,
     FileEntry,
+    PostedReviewComment,
     PullRequest,
     RepoRef,
     ReviewEvent,
@@ -60,6 +61,14 @@ class FakeGitHub:
     def post_comment(self, pr: PullRequest, body: str) -> None:
         self.posted_comments.append((pr, body))
 
+    def list_self_review_comments(
+        self, pr: PullRequest
+    ) -> tuple[PostedReviewComment, ...]:
+        # 웹훅 흐름 테스트는 dedup 동작과 무관 — 항상 빈 history 반환.
+        # CrossPrFindingDeduper 의 진짜 동작은 별도 단위 테스트
+        # (`test_cross_pr_finding_deduper.py`) 에서 검증.
+        return ()
+
     def get_installation_token(self, installation_id: int) -> str:
         return "fake-token"
 
@@ -99,6 +108,17 @@ class FakeFindingVerifier:
         return result
 
 
+class FakeFindingDeduper:
+    """기본은 finding 을 그대로 반환 — 웹훅 흐름 테스트는 cross-PR dedup 로직과 무관.
+
+    CrossPrFindingDeduper 의 진짜 동작은 별도 단위 테스트 (`test_cross_pr_finding_deduper.py`)
+    에서 검증. 여기서는 use case 가 deduper 를 호출하기만 하면 됨.
+    """
+
+    def dedupe(self, result: ReviewResult, pr: PullRequest) -> ReviewResult:
+        return result
+
+
 def _sign(body: bytes) -> str:
     return "sha256=" + hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
 
@@ -132,6 +152,7 @@ def _build_handler(
         file_collector=FakeCollector(dump),
         engine=FakeEngine(result),
         finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
         max_input_tokens=1000,
     )
     return WebhookHandler(secret=SECRET, github=github, use_case=use_case)
@@ -229,6 +250,7 @@ def test_use_case_posts_comment_when_budget_exceeded(tmp_path: Path) -> None:
         file_collector=FakeCollector(dump),
         engine=FakeEngine(ReviewResult(summary="x", event=ReviewEvent.COMMENT)),
         finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
         max_input_tokens=1,
     )
 
@@ -256,6 +278,7 @@ def test_use_case_posts_review_when_budget_fits(tmp_path: Path) -> None:
         file_collector=FakeCollector(dump),
         engine=FakeEngine(expected),
         finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
         max_input_tokens=1000,
     )
 
@@ -264,6 +287,61 @@ def test_use_case_posts_review_when_budget_fits(tmp_path: Path) -> None:
     assert github.posted_comments == []
     assert len(github.posted_reviews) == 1
     assert github.posted_reviews[0][1] is expected
+
+
+def test_use_case_chains_verify_then_dedupe_then_post(tmp_path: Path) -> None:
+    """오케스트레이션 순서 lock: engine → verifier → deduper → post_review.
+
+    회귀 방지: dedup 결과가 post_review 에 도달해야 한다 (Layer D 의 강등이 게시에 반영).
+    또한 deduper 가 verifier 출력을 받아야 — 순서가 뒤집히면 verifier 가 강등하기 전의
+    원본 등급이 dedup signature 형성에 쓰여 false positive 가 발생할 수 있다.
+    """
+    github = FakeGitHub()
+    pr = _sample_pr()
+
+    dump = FileDump(
+        entries=(FileEntry(path="a.py", content="x=1", size_bytes=3, is_changed=True),),
+        total_chars=3,
+        exceeded_budget=False,
+    )
+    engine_result = ReviewResult(summary="from-engine", event=ReviewEvent.COMMENT)
+    verified_result = ReviewResult(summary="from-verifier", event=ReviewEvent.COMMENT)
+    deduped_result = ReviewResult(summary="from-deduper", event=ReviewEvent.COMMENT)
+
+    class _OrderObservingVerifier:
+        def __init__(self) -> None:
+            self.received: ReviewResult | None = None
+
+        def verify(self, result: ReviewResult, repo_root: Path) -> ReviewResult:
+            self.received = result
+            return verified_result
+
+    class _OrderObservingDeduper:
+        def __init__(self) -> None:
+            self.received: ReviewResult | None = None
+
+        def dedupe(self, result: ReviewResult, pr: PullRequest) -> ReviewResult:
+            self.received = result
+            return deduped_result
+
+    verifier = _OrderObservingVerifier()
+    deduper = _OrderObservingDeduper()
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=FakeEngine(engine_result),
+        finding_verifier=verifier,
+        finding_deduper=deduper,
+        max_input_tokens=1000,
+    )
+
+    use_case.execute(pr)
+
+    assert verifier.received is engine_result, "verifier 는 engine 출력을 받아야"
+    assert deduper.received is verified_result, "deduper 는 verifier 출력을 받아야 (순서 lock)"
+    assert len(github.posted_reviews) == 1
+    assert github.posted_reviews[0][1] is deduped_result, "게시되는 건 deduper 출력"
 
 
 def test_accept_queues_valid_pr_and_returns_202(tmp_path: Path) -> None:
@@ -350,6 +428,7 @@ def _build_handler_with_engine(
         file_collector=FakeCollector(dump),
         engine=engine,  # type: ignore[arg-type]
         finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
         max_input_tokens=1000,
     )
     return WebhookHandler(secret=SECRET, github=gh, use_case=use_case)
@@ -527,6 +606,7 @@ def _build_handler_for_parallel_test(
         file_collector=FakeCollector(dump),
         engine=engine,  # type: ignore[arg-type]
         finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
         max_input_tokens=1000,
     )
     handler = WebhookHandler(
