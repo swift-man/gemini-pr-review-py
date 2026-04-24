@@ -12,6 +12,9 @@ from gemini_review.infrastructure.file_dump_collector import FileDumpCollector
 from gemini_review.infrastructure.gemini_cli_engine import GeminiAuthError, GeminiCliEngine
 from gemini_review.infrastructure.git_repo_fetcher import GitRepoFetcher
 from gemini_review.infrastructure.github_app_client import GitHubAppClient
+from gemini_review.infrastructure.source_grounded_finding_verifier import (
+    SourceGroundedFindingVerifier,
+)
 from gemini_review.logging_utils import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -52,6 +55,7 @@ def build_handler(settings: Settings) -> WebhookHandler:
         repo_fetcher=repo_fetcher,
         file_collector=collector,
         engine=engine,
+        finding_verifier=SourceGroundedFindingVerifier(),
         max_input_tokens=settings.gemini_max_input_tokens,
     )
     return WebhookHandler(

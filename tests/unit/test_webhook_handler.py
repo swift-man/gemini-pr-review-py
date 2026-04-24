@@ -88,6 +88,17 @@ class FakeEngine:
         return self._result
 
 
+class FakeFindingVerifier:
+    """기본은 finding 을 그대로 반환 — 웹훅 흐름 테스트는 phantom-quote 검증 로직과 무관.
+
+    SourceGroundedFindingVerifier 의 진짜 동작은 별도 단위 테스트 (`test_source_grounded_finding_verifier.py`)
+    에서 검증. 여기서는 use case 가 verifier 를 호출하기만 하면 됨.
+    """
+
+    def verify(self, result: ReviewResult, repo_root: Path) -> ReviewResult:
+        return result
+
+
 def _sign(body: bytes) -> str:
     return "sha256=" + hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
 
@@ -120,6 +131,7 @@ def _build_handler(
         repo_fetcher=FakeFetcher(tmp),
         file_collector=FakeCollector(dump),
         engine=FakeEngine(result),
+        finding_verifier=FakeFindingVerifier(),
         max_input_tokens=1000,
     )
     return WebhookHandler(secret=SECRET, github=github, use_case=use_case)
@@ -216,6 +228,7 @@ def test_use_case_posts_comment_when_budget_exceeded(tmp_path: Path) -> None:
         repo_fetcher=FakeFetcher(tmp_path),
         file_collector=FakeCollector(dump),
         engine=FakeEngine(ReviewResult(summary="x", event=ReviewEvent.COMMENT)),
+        finding_verifier=FakeFindingVerifier(),
         max_input_tokens=1,
     )
 
@@ -242,6 +255,7 @@ def test_use_case_posts_review_when_budget_fits(tmp_path: Path) -> None:
         repo_fetcher=FakeFetcher(tmp_path),
         file_collector=FakeCollector(dump),
         engine=FakeEngine(expected),
+        finding_verifier=FakeFindingVerifier(),
         max_input_tokens=1000,
     )
 
@@ -335,6 +349,7 @@ def _build_handler_with_engine(
         repo_fetcher=FakeFetcher(tmp_path),
         file_collector=FakeCollector(dump),
         engine=engine,  # type: ignore[arg-type]
+        finding_verifier=FakeFindingVerifier(),
         max_input_tokens=1000,
     )
     return WebhookHandler(secret=SECRET, github=gh, use_case=use_case)
@@ -511,6 +526,7 @@ def _build_handler_for_parallel_test(
         repo_fetcher=FakeFetcher(tmp_path),
         file_collector=FakeCollector(dump),
         engine=engine,  # type: ignore[arg-type]
+        finding_verifier=FakeFindingVerifier(),
         max_input_tokens=1000,
     )
     handler = WebhookHandler(

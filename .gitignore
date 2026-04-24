@@ -29,3 +29,4 @@ id_ed25519
 # runtime caches
 repos_cache/
 .gemini-review/
+.claude/

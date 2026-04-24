@@ -1,13 +1,19 @@
 import logging
 
 from gemini_review.domain import FileDump, PullRequest, TokenBudget
-from gemini_review.interfaces import FileCollector, GitHubClient, RepoFetcher, ReviewEngine
+from gemini_review.interfaces import (
+    FileCollector,
+    FindingVerifier,
+    GitHubClient,
+    RepoFetcher,
+    ReviewEngine,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class ReviewPullRequestUseCase:
-    """리뷰 파이프라인 오케스트레이션: PR 조회 → 체크아웃 → 파일 수집 → 리뷰 → 게시."""
+    """리뷰 파이프라인 오케스트레이션: PR 조회 → 체크아웃 → 파일 수집 → 리뷰 → 검증 → 게시."""
 
     def __init__(
         self,
@@ -15,12 +21,14 @@ class ReviewPullRequestUseCase:
         repo_fetcher: RepoFetcher,
         file_collector: FileCollector,
         engine: ReviewEngine,
+        finding_verifier: FindingVerifier,
         max_input_tokens: int,
     ) -> None:
         self._github = github
         self._repo_fetcher = repo_fetcher
         self._file_collector = file_collector
         self._engine = engine
+        self._finding_verifier = finding_verifier
         self._budget = TokenBudget(max_tokens=max_input_tokens)
 
     def execute(self, pr: PullRequest) -> None:
@@ -50,6 +58,10 @@ class ReviewPullRequestUseCase:
             len(dump.excluded),
         )
         result = self._engine.review(pr, dump)
+        # 후처리 검증 — 모델이 본문에 인용한 텍스트가 실제 소스 라인에 존재하는지 디스크
+        # 레벨로 확인. phantom quote 환각 (예: 모델이 `"@scope"` 를 `" @scope"` 로 잘못
+        # 토큰화 → "원본에 공백" 단언) 을 [Suggestion] 으로 강등.
+        result = self._finding_verifier.verify(result, repo_path)
         self._github.post_review(pr, result)
 
 
