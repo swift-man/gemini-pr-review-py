@@ -351,6 +351,58 @@ def test_parse_does_not_downgrade_minor_or_suggestion() -> None:
     assert all("자동 강등" not in f.body for f in result.findings)
 
 
+# --- Phantom whitespace / CI 실패 환각 — 정당한 finding 보존 정책 (codex PR #22 review) ---
+#
+# 사용자 신고 사례 5 (2026-04) 의 phantom whitespace / false CI failure 환각은 처음에
+# 패턴 강등으로 잡으려 했으나, codex 가 정당히 지적: `불필요한 공백`, `command not found`
+# 같은 표현은 정상 버그 리포트에서도 흔히 등장. 패턴 강등은 정당한 finding 까지 약화시켜
+# 신호 가치를 거꾸로 깎는다. 이 환각은 PR #23 (`SourceGroundedFindingVerifier`) 의 디스크
+# 검증으로 처리 — 모델이 인용한 텍스트가 실제 라인에 없을 때만 강등 → false positive 0.
+# 아래 negative 테스트는 패턴 기반 강등이 다시 추가되는 회귀를 막는다.
+
+
+def test_parse_does_not_downgrade_real_whitespace_finding() -> None:
+    """실제 whitespace 버그 리포트는 강등되지 않아야 — 패턴 강등 회귀 방지.
+
+    회귀 방지 (codex PR #22 review): `불필요한 공백` 같은 표현은 정상 finding 도 사용.
+    이 본문이 [Critical] 으로 그대로 통과해야 한다. PR #23 의 verifier 가 실제 디스크
+    검증 시 처리.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "REQUEST_CHANGES",
+      "comments": [
+        {"path": "src/x.py", "line": 10, "body": "[Critical] 함수명 앞에 불필요한 공백이 있어 import 가 깨집니다."}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.findings[0].body.startswith("[Critical]"), (
+        "패턴만으로 강등하면 정당한 whitespace finding 도 약화 — 회귀"
+    )
+    assert "자동 강등" not in result.findings[0].body
+
+
+def test_parse_does_not_downgrade_real_command_not_found_finding() -> None:
+    """실제 CI/shell 장애 리포트는 강등되지 않아야 — 패턴 강등 회귀 방지.
+
+    회귀 방지: `command not found` 는 진짜 shell 장애를 짚는 finding 도 사용. CI status
+    검증 정보 없이 패턴만으로 강등하면 실제 장애를 환각 처리하는 사고.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "REQUEST_CHANGES",
+      "comments": [
+        {"path": "Makefile", "line": 5, "body": "[Critical] 새로 추가된 도구가 PATH 에 없어 command not found 로 빌드가 실패합니다."}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.findings[0].body.startswith("[Critical]")
+
+
 # --- Event normalization (REQUEST_CHANGES weakening) -----------------------
 
 

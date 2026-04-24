@@ -215,3 +215,55 @@ def test_prompt_contains_path_grounding_and_severity_discipline() -> None:
     assert "확신이 낮은 지적" in prompt or "확신 낮으면" in prompt
     # 실관측 escape 환각 표현 인용 — 모델이 같은 표현을 안 답습하도록
     assert "리터럴 'n'" in prompt or "리터럴 \"n\"" in prompt
+
+
+def test_prompt_warns_against_phantom_whitespace_and_false_ci_failure() -> None:
+    """Phantom whitespace / false CI failure 환각 차단 섹션 존재 + 핵심 키워드 검증.
+
+    회귀 방지 (사용자 신고 사례 5, 2026-04): swift-man/MaterialDesignColor PR #7 등에서
+    `"@scope"` 같은 인용을 모델이 `" @scope"` 로 잘못 토큰화해 "원본에 공백 있다" 단언,
+    같은 commit CI 가 SUCCESS 인 변경에 "command not found" 단언 등 환각 반복. 프롬프트에
+    구체 anti-pattern 과 후처리 검증 정책이 명시돼 있어야 같은 환각 답습 방지.
+    """
+    dump = FileDump(entries=(), total_chars=0)
+    prompt = build_prompt(_pr(), dump)
+
+    # 새 환각 카테고리 섹션 헤더
+    assert "Phantom 공백" in prompt or "phantom whitespace" in prompt.lower()
+    # 토큰화 아티팩트 메커니즘 설명 — 모델이 자기 환각의 원인을 인지하도록
+    assert "토큰화" in prompt
+    # 실관측 환각 패턴 인용 (모델이 같은 표현 답습 금지)
+    assert "패키지명 앞에 불필요한 공백" in prompt
+    assert "띄어쓰기 오타" in prompt
+    # CI SUCCESS 케이스의 false 실패 단언 금지 명시
+    assert "command not found" in prompt
+    assert "CI" in prompt and ("즉시 실패" in prompt or "SUCCESS" in prompt)
+    # 후처리 검증 정책 명시 — 백틱 인용으로 raw 텍스트 표기하면 disk 검증 가능
+    assert "SourceGroundedFindingVerifier" in prompt or "후처리" in prompt
+    # backtick 인용 권장 — verifier 가 정확히 매칭하도록 raw line 인용 유도
+    assert "백틱" in prompt or "backtick" in prompt
+
+
+def test_phantom_examples_use_unambiguous_wrong_vs_real_labels() -> None:
+    """❌ 잘못된 환각 / ✅ 실제 소스 라인 레이블이 모든 phantom 예시에 짝지어 등장.
+
+    회귀 방지 (gemini PR #22 review): 이전 버전은 `❌` 와 `←` 만으로 wrong-vs-real 을
+    구분했는데, 리뷰 봇 자체가 phantom 주장 줄과 실제 소스 줄을 혼동해서 "실제 라인에
+    공백이 있다" 는 오류 보고를 남겼다. 모델 reading path 도 같은 모호함에 노출됨.
+    명시적인 `잘못된 환각:` / `실제 소스 라인:` 레이블로 구조를 시각적으로 못 박는다.
+
+    각 phantom 사례는 ❌ + ✅ 한 쌍 — 개수가 일치해야 짝이 맞는다. 한쪽만 늘어나면
+    해석이 깨진다.
+    """
+    dump = FileDump(entries=(), total_chars=0)
+    prompt = build_prompt(_pr(), dump)
+
+    wrong_count = prompt.count("❌ 잘못된 환각:")
+    real_count = prompt.count("✅ 실제 소스 라인:")
+    assert wrong_count >= 2, (
+        f"phantom 사례 ❌ 라벨이 2건 이상 있어야 (관측 사례). 실제 {wrong_count}건"
+    )
+    assert wrong_count == real_count, (
+        f"❌ ({wrong_count}) 와 ✅ ({real_count}) 개수가 같아야 짝이 맞음 — 한쪽만 늘면"
+        " phantom/real 짝짓기 해석이 깨진다"
+    )

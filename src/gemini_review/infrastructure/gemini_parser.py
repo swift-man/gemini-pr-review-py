@@ -24,6 +24,12 @@ _SEVERITY_PREFIX_HEAD = re.compile(r"^\[(Critical|Major|Minor|Suggestion)\] (.*)
 # **본문에 등장하는 강한 표지**만 골랐고, 일반 단어("escape", "literal") 만으로는 매칭하지
 # 않는다. 새 환각 표현이 또 관찰되면 여기에 누적.
 _HALLUCINATION_PATTERNS = (
+    # --- escape 시퀀스 오독 (사용자 신고 사례 1·4) ----------------------------
+    # 이 패턴들은 escape 시퀀스 환각의 매우 좁은 표지 — 정상 버그 리포트에서 거의
+    # 사용되지 않아 false positive 위험이 낮음. 일반적인 본문 표현 ("불필요한 공백",
+    # "command not found" 등) 은 정당한 finding 에서도 흔히 쓰이므로 여기 추가하지
+    # 않는다 (codex PR #22 review). phantom whitespace / false CI failure 환각은
+    # `SourceGroundedFindingVerifier` 가 디스크 검증으로 잡음 (PR #23, Layer B).
     "리터럴 'n'",
     "리터럴 \"n\"",
     "리터럴 `n`",
