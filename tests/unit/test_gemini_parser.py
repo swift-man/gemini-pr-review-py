@@ -351,93 +351,56 @@ def test_parse_does_not_downgrade_minor_or_suggestion() -> None:
     assert all("자동 강등" not in f.body for f in result.findings)
 
 
-# --- Phantom whitespace / CI 실패 환각 (사용자 신고 사례 5, 2026-04 추가) ---
+# --- Phantom whitespace / CI 실패 환각 — 정당한 finding 보존 정책 (codex PR #22 review) ---
+#
+# 사용자 신고 사례 5 (2026-04) 의 phantom whitespace / false CI failure 환각은 처음에
+# 패턴 강등으로 잡으려 했으나, codex 가 정당히 지적: `불필요한 공백`, `command not found`
+# 같은 표현은 정상 버그 리포트에서도 흔히 등장. 패턴 강등은 정당한 finding 까지 약화시켜
+# 신호 가치를 거꾸로 깎는다. 이 환각은 PR #23 (`SourceGroundedFindingVerifier`) 의 디스크
+# 검증으로 처리 — 모델이 인용한 텍스트가 실제 라인에 없을 때만 강등 → false positive 0.
+# 아래 negative 테스트는 패턴 기반 강등이 다시 추가되는 회귀를 막는다.
 
 
-def test_parse_downgrades_critical_on_phantom_whitespace_assertion(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """`불필요한 공백` 단언이 [Critical]/[Major] 본문에 있으면 [Suggestion] 강등.
+def test_parse_does_not_downgrade_real_whitespace_finding() -> None:
+    """실제 whitespace 버그 리포트는 강등되지 않아야 — 패턴 강등 회귀 방지.
 
-    실관측 회귀 (사용자 신고 사례 5): swift-man/MaterialDesignColor PR #7 README.md:120
-    에서 모델이 `"@swift-man/material-design-color"` 인용을 `" @swift-man/..."` 로 잘못
-    토큰화하고, 이를 거꾸로 "원본에 공백 있음" 으로 단언. 같은 PR 의 3회 연속 push 에
-    대해 동일 환각 반복. 메인테이너가 매번 `awk '{print "[" $0 "]"}'` 로 라인 검증해야
-    하는 alert fatigue 발생.
+    회귀 방지 (codex PR #22 review): `불필요한 공백` 같은 표현은 정상 finding 도 사용.
+    이 본문이 [Critical] 으로 그대로 통과해야 한다. PR #23 의 verifier 가 실제 디스크
+    검증 시 처리.
     """
     raw = """
     {
       "summary": "ok",
       "event": "REQUEST_CHANGES",
       "comments": [
-        {"path": "README.md", "line": 120, "body": "[Major] 예제 코드의 패키지명 앞에 불필요한 공백이 포함되어 있습니다."}
-      ]
-    }
-    """
-    with caplog.at_level(logging.WARNING):
-        result = parse_review(raw)
-
-    assert len(result.findings) == 1
-    body = result.findings[0].body
-    assert body.startswith("[Suggestion]"), "phantom whitespace 단언은 강등돼야"
-    assert "원래 [Major]" in body, "원래 등급이 보존돼야 silent rewrite 방지"
-    downgrade_warns = [r for r in caplog.records if "downgrading severity" in r.getMessage()]
-    assert len(downgrade_warns) == 1
-
-
-def test_parse_downgrades_critical_on_phantom_typo_assertion() -> None:
-    """`띄어쓰기 오타` 단언도 같은 환각 카테고리 — 강등 대상.
-
-    실관측 회귀: swift.yml:29 의 `npx --package typescript@5.4.5` (공백 0) 에 대해
-    "공백 있어서 CI 즉시 실패" 단언. 같은 commit 의 CI 는 SUCCESS — 검증 가능한 거짓.
-    """
-    raw = """
-    {
-      "summary": "ok",
-      "event": "REQUEST_CHANGES",
-      "comments": [
-        {"path": ".github/workflows/swift.yml", "line": 29, "body": "[Critical] npx 명령어에 띄어쓰기 오타가 있습니다."}
+        {"path": "src/x.py", "line": 10, "body": "[Critical] 함수명 앞에 불필요한 공백이 있어 import 가 깨집니다."}
       ]
     }
     """
     result = parse_review(raw)
-    assert result.findings[0].body.startswith("[Suggestion]")
-    assert "원래 [Critical]" in result.findings[0].body
+    assert result.findings[0].body.startswith("[Critical]"), (
+        "패턴만으로 강등하면 정당한 whitespace finding 도 약화 — 회귀"
+    )
+    assert "자동 강등" not in result.findings[0].body
 
 
-def test_parse_downgrades_critical_on_false_command_not_found_assertion() -> None:
-    """`command not found` 단언 환각 — CI 가 SUCCESS 인 변경에 대한 거짓 실패 단언.
+def test_parse_does_not_downgrade_real_command_not_found_finding() -> None:
+    """실제 CI/shell 장애 리포트는 강등되지 않아야 — 패턴 강등 회귀 방지.
 
-    회귀 방지: 같은 사용자 신고에서, 정상 `typescript@5.4.5` 명령에 대해 "shell 이
-    `@5.4.5` 를 binary 로 해석해 command not found" 라고 단언. 검증 가능한 거짓.
+    회귀 방지: `command not found` 는 진짜 shell 장애를 짚는 finding 도 사용. CI status
+    검증 정보 없이 패턴만으로 강등하면 실제 장애를 환각 처리하는 사고.
     """
     raw = """
     {
       "summary": "ok",
       "event": "REQUEST_CHANGES",
       "comments": [
-        {"path": ".github/workflows/swift.yml", "line": 29,
-         "body": "[Critical] CI 가 command not found 로 즉시 실패합니다."}
+        {"path": "Makefile", "line": 5, "body": "[Critical] 새로 추가된 도구가 PATH 에 없어 command not found 로 빌드가 실패합니다."}
       ]
     }
     """
     result = parse_review(raw)
-    assert result.findings[0].body.startswith("[Suggestion]")
-
-
-def test_parse_downgrades_critical_on_immediate_failure_assertion() -> None:
-    """`즉시 실패` 단언 환각 — 검증 안 된 강한 실패 주장."""
-    raw = """
-    {
-      "summary": "ok",
-      "event": "REQUEST_CHANGES",
-      "comments": [
-        {"path": "x.yml", "line": 1, "body": "[Major] 이 변경으로 CI 빌드가 즉시 실패합니다."}
-      ]
-    }
-    """
-    result = parse_review(raw)
-    assert result.findings[0].body.startswith("[Suggestion]")
+    assert result.findings[0].body.startswith("[Critical]")
 
 
 # --- Event normalization (REQUEST_CHANGES weakening) -----------------------

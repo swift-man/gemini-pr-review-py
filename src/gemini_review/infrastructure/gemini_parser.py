@@ -25,6 +25,11 @@ _SEVERITY_PREFIX_HEAD = re.compile(r"^\[(Critical|Major|Minor|Suggestion)\] (.*)
 # 않는다. 새 환각 표현이 또 관찰되면 여기에 누적.
 _HALLUCINATION_PATTERNS = (
     # --- escape 시퀀스 오독 (사용자 신고 사례 1·4) ----------------------------
+    # 이 패턴들은 escape 시퀀스 환각의 매우 좁은 표지 — 정상 버그 리포트에서 거의
+    # 사용되지 않아 false positive 위험이 낮음. 일반적인 본문 표현 ("불필요한 공백",
+    # "command not found" 등) 은 정당한 finding 에서도 흔히 쓰이므로 여기 추가하지
+    # 않는다 (codex PR #22 review). phantom whitespace / false CI failure 환각은
+    # `SourceGroundedFindingVerifier` 가 디스크 검증으로 잡음 (PR #23, Layer B).
     "리터럴 'n'",
     "리터럴 \"n\"",
     "리터럴 `n`",
@@ -34,20 +39,6 @@ _HALLUCINATION_PATTERNS = (
     "이스케이프 누락",  # "개행 문자 이스케이프가 누락" 류 — escape 오독의 정형 표현
     "@@n",  # 모델이 "@@n 등으로 하드코딩" 같은 식으로 가짜 패턴 인용
     "+xn",  # 동일 카테고리의 가짜 patch 인용
-    # --- phantom whitespace / 가짜 오타 단언 (사용자 신고 사례 5 — 2026-04 추가) ----
-    # 토큰화 아티팩트로 모델이 자기 토큰 표현을 "원본 공백" 으로 단언하는 패턴.
-    # 예: `"@scope"` 가 토큰 시퀀스 `"`, `@scope` 로 분해돼 모델 내부에서
-    # `" @scope"` 처럼 보이고, 이를 "원본에 공백 있음" 이라고 잘못 보고함.
-    # 실관측: README.md, CHANGELOG.md, .github/workflows/*.yml 라인에서 패키지명/
-    # 명령어 앞뒤 phantom whitespace 를 [Critical]/[Major] 로 반복 단언.
-    "불필요한 공백",
-    "띄어쓰기 오타",
-    # --- 검증 안 된 CI 실패 단언 (사용자 신고 사례 5 — 2026-04 추가) -------------
-    # CI status 가 SUCCESS 인 변경에 "command not found" / "CI 즉시 실패" 류를
-    # 단언하는 환각. 실측 회귀: typescript@5.4.5 같은 정상 npx 명령에 대해
-    # "공백 때문에 즉시 실패" 단언, 같은 commit 의 CI 는 SUCCESS.
-    "command not found",
-    "즉시 실패",
 )
 # Hot path 마이크로 최적화: finding 마다 `p.lower()` 를 다시 부르지 않도록 모듈 로드
 # 시 한 번 (원형, 소문자) 쌍으로 미리 묶어 둔다. 매 호출마다 zip 을 다시 돌리는 비용도

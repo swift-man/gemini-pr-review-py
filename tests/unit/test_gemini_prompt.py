@@ -223,7 +223,7 @@ def test_prompt_warns_against_phantom_whitespace_and_false_ci_failure() -> None:
     회귀 방지 (사용자 신고 사례 5, 2026-04): swift-man/MaterialDesignColor PR #7 등에서
     `"@scope"` 같은 인용을 모델이 `" @scope"` 로 잘못 토큰화해 "원본에 공백 있다" 단언,
     같은 commit CI 가 SUCCESS 인 변경에 "command not found" 단언 등 환각 반복. 프롬프트에
-    구체 anti-pattern 과 자동 강등 키워드가 명시돼 있어야 같은 환각 답습 방지.
+    구체 anti-pattern 과 후처리 검증 정책이 명시돼 있어야 같은 환각 답습 방지.
     """
     dump = FileDump(entries=(), total_chars=0)
     prompt = build_prompt(_pr(), dump)
@@ -238,6 +238,7 @@ def test_prompt_warns_against_phantom_whitespace_and_false_ci_failure() -> None:
     # CI SUCCESS 케이스의 false 실패 단언 금지 명시
     assert "command not found" in prompt
     assert "CI" in prompt and ("즉시 실패" in prompt or "SUCCESS" in prompt)
-    # 자동 강등 키워드 명시 (파서 동작과 일치)
-    assert "자동 강등" in prompt
-    assert "불필요한 공백" in prompt
+    # 후처리 검증 정책 명시 — 백틱 인용으로 raw 텍스트 표기하면 disk 검증 가능
+    assert "SourceGroundedFindingVerifier" in prompt or "후처리" in prompt
+    # backtick 인용 권장 — verifier 가 정확히 매칭하도록 raw line 인용 유도
+    assert "백틱" in prompt or "backtick" in prompt
