@@ -20,17 +20,15 @@ logger = logging.getLogger(__name__)
 
 # 본문에 이런 키워드가 있으면 "원본 텍스트에 대한 단언" 일 가능성 높음 → quote 검증 발동.
 # 정상적인 권고/제안 본문 (예: "pathlib.Path 를 쓰세요") 은 대개 이 키워드 없음 → 거짓
-# 양성 줄임. 새 단언형 키워드가 관찰되면 여기에 누적.
-# 영문 키워드는 모두 소문자로 보관하고, 매칭 시 body 도 소문자로 변환해 비교 — 모델이
-# `Whitespace`/`Typo` 처럼 첫 글자 대문자로 시작해도 검증이 발동하도록
-# (codex PR #23 review #2). 한글 키워드는 case 무관.
-_ASSERTION_HINTS = (
-    "공백",
-    "띄어쓰기",
-    "오타",
-    "whitespace",
-    "spacing",
-    "typo",
+# 양성 줄임.
+#
+# 한국어 힌트는 substring 매칭 (한국어는 단어 경계가 없음).
+# 영문 힌트는 word-boundary regex 매칭 — `namespacing` 안의 `spacing` 같은 부분 매칭으로
+# 검증이 잘못 발동하는 false positive 방지 (codex PR #23 review #5).
+_KOREAN_ASSERTION_HINTS = ("공백", "띄어쓰기", "오타")
+_ENGLISH_ASSERTION_HINT_RE = re.compile(
+    r"\b(?:whitespace|spacing|typo)\b",
+    re.IGNORECASE,
 )
 
 # body 에서 backtick 인용된 substring 추출 — 모델이 "원본은 이렇다" 단언 시 가장 자주
@@ -38,24 +36,6 @@ _ASSERTION_HINTS = (
 _BACKTICK_QUOTE = re.compile(r"`([^`]+)`")
 _SEVERITY_PREFIX_HEAD = re.compile(r"^\[(Critical|Major|Minor|Suggestion)\] (.*)", re.DOTALL)
 _BLOCKING_SEVERITIES = frozenset({"Critical", "Major"})
-
-# 본문이 "현재값 → 수정안" 형태의 정상 typo/공백 finding 임을 시사하는 표지.
-# 이 표지가 있으면 lenient 매칭 (인용 중 하나라도 라인에 있으면 통과 — 현재값만 검증);
-# 없으면 strict 매칭 (모든 인용이 라인에 있어야 통과 — phantom + real 혼합 차단).
-# 영문 패턴은 소문자로 보관, 매칭 시 body 도 소문자화 (codex PR #23 review #4 정책 조정).
-_FIX_PATTERN_HINTS = (
-    "→",  # 한국어 화살표
-    "->",  # ASCII 화살표
-    "로 변경",
-    "로 수정",
-    "으로 변경",
-    "으로 수정",
-    "대신",  # "X 대신 Y 사용"
-    "should be",
-    "instead of",
-    "rather than",
-    "replace",
-)
 
 
 class SourceGroundedFindingVerifier:
@@ -67,20 +47,23 @@ class SourceGroundedFindingVerifier:
         ### 강등 발동 조건 (모두 만족)
 
         1. body 가 [Critical] 또는 [Major] 시작
-        2. body 에 assertion hint 키워드 ("공백", "띄어쓰기", "오타", ...) 포함 — 단언으로 추정
+        2. body 에 assertion hint 키워드 (한글: "공백"/"띄어쓰기"/"오타", 영문 word-boundary
+           매칭: `whitespace`/`spacing`/`typo`) 포함
         3. body 에 backtick 인용 substring 이 1개 이상
-        4. **인용 substring 중 단 하나도** path:line 의 raw 라인에 없음 (lenient: any-match → keep)
+        4. **인용 중 하나라도** path:line 의 raw 라인에 없음 (strict all-match → keep)
 
-        ### 왜 "any-match → keep" lenient 정책인가
+        ### 정책 변천 — strict only 로 단순화 (codex PR #23 review #4 → #6)
 
-        codex PR #23 review #1 — 정상적인 typo/공백 finding 은 `현재 코드 → 수정안` 형태로
-        두 텍스트를 함께 인용함. 예: "`usrname` 을 `username` 으로 수정". 옛 strict 정책
-        ("any quote not in line → downgrade") 은 수정안 `username` 이 라인에 없다는 이유로
-        정당한 finding 까지 강등시킴. 새 lenient 정책은 인용 중 **하나라도** 라인에 있으면
-        통과 — `usrname` 이 라인에 있으니 정당한 finding 그대로 유지.
+        초기 lenient ("any-match → keep") 정책은 typo+fix 패턴을 보호했지만 phantom + real
+        혼합 본문 ("`usrname` 대신 `\" usrname\"` 사용" 같은) 도 1개 매치로 통과시켜 환각
+        [Critical] 우회 경로가 됐다. fix-pattern hint (`→`, `로 수정` 등) 로 lenient 발동을
+        좁히려 했으나, codex review #6 의 추가 지적: 같은 fix-pattern hint 가 phantom 본문
+        에서도 등장 가능 (예: "`usrname` 대신 `phantom`" 같이 hint 가 들어간 phantom case).
+        의미 구별은 NLP 없이 표면 패턴만으로 불가능.
 
-        Phantom case (사용자 신고): 모델이 인용한 텍스트는 `" @scope"` 단 하나, 라인에는
-        `"@scope"` (공백 0). 어떤 인용도 라인에 매치 안 됨 → 강등 발동.
+        결정: **strict only**. 모든 backtick 인용이 라인에 매치돼야 통과. typo+fix finding
+        도 [Suggestion] 으로 강등되지만 본문/원래 등급은 보존돼 사용자가 직접 판단 가능.
+        false positive (정당 finding 강등) 비용을 받아들이고 phantom 차단을 우선.
 
         강등으로 blocking 분포가 바뀌면 `_normalize_event` 가 event 를 재정합.
 
@@ -115,10 +98,10 @@ class SourceGroundedFindingVerifier:
         # assertion hint 검사: 키워드 없으면 단순 권고/제안 — 검증 생략 (false positive 방지).
         # 정상 권고 본문 (예: "pathlib.Path 를 쓰세요") 까지 검증하면 인용된 API 이름이
         # 라인에 없다는 이유로 모두 강등돼 신호 가치를 잃는다.
-        # body 를 소문자로 변환해 매칭 — 영문 키워드의 첫글자 대문자 케이스 (예: `Whitespace`,
-        # `Typo`) 도 잡힘 (codex PR #23 review #2).
-        body_lower = f.body.lower()
-        if not any(hint in body_lower for hint in _ASSERTION_HINTS):
+        # 한국어 힌트는 substring, 영문 힌트는 word-boundary regex (codex PR #23 review #5):
+        # `namespacing` 안의 `spacing` 같은 부분 매칭으로 검증이 잘못 발동하던 false positive
+        # 방지. 영문은 case-insensitive (review #2 도 함께 만족).
+        if not _has_assertion_hint(f.body):
             return f
         quotes = _BACKTICK_QUOTE.findall(f.body)
         if not quotes:
@@ -144,31 +127,19 @@ class SourceGroundedFindingVerifier:
                     f"원래 [{severity}]) {rest}"
                 ),
             )
-        # 매칭 정책 (codex PR #23 review #1 → #4 의 추가 조정):
-        #
-        # - **fix-pattern lenient**: body 가 "현재값 → 수정안" 형태의 표지 (`→`, `로 변경`,
-        #   `should be` 등) 를 포함하면 정상 typo finding 으로 보고 lenient 매칭 — 인용 중
-        #   하나라도 라인에 있으면 통과. 현재값만 검증되면 충분 (수정안은 라인에 없는 게 정상).
-        # - **strict default**: 그 외엔 모든 인용이 라인에 있어야 통과. phantom quote 가
-        #   real quote 와 함께 한 본문에 들어가 있는 경우 ("phantom 공백 `\" usrname\"` 을
-        #   `usrname` 에서 제거" 같은) 를 strict 로 잡는다. 전부 매칭이 아니면 phantom 의심.
-        #
-        # 이 정책은 codex review #4 의 우려 — lenient any-match 가 phantom + real 혼합을
-        # 통과시킴 — 를 좁히면서, review #1 의 정상 typo+fix 패턴도 보호.
+        # 매칭 정책: **strict only** (codex PR #23 review #4 → #6 의 최종 조정).
+        # 모든 backtick 인용이 라인에 매치돼야 통과. 하나라도 없으면 phantom 의심으로 강등.
+        # typo+fix 패턴 ("`old` → `new`") 도 strict 에선 강등되지만 본문 + 원래 등급은
+        # 보존돼 사용자가 직접 판단 가능. lenient/fix-pattern 휴리스틱은 phantom + real
+        # 혼합 본문 우회를 못 막아 NLP 없이는 정확한 구별 불가하다는 결론.
         matches = [q for q in quotes if q in line]
-        if _has_fix_pattern(body_lower):
-            # fix-pattern 표지 있음 → lenient: 현재값 1개만 매치되면 통과
-            if matches:
-                return f
-        else:
-            # fix-pattern 표지 없음 → strict: 모든 인용이 라인에 있어야 통과
-            if len(matches) == len(quotes):
-                return f
+        if len(matches) == len(quotes):
+            return f
         # 매칭 실패 — phantom quote 환각으로 강등
         first_missing = next(q for q in quotes if q not in line)
         logger.warning(
             "downgrading severity %s -> Suggestion: phantom-quote in %s:%d "
-            "(missing: %r, total quotes=%d, matched=%d, fix_pattern=%s). "
+            "(missing: %r, total quotes=%d, matched=%d). "
             "assertion-hint keyword triggered verification.",
             severity,
             f.path,
@@ -176,7 +147,6 @@ class SourceGroundedFindingVerifier:
             first_missing,
             len(quotes),
             len(matches),
-            _has_fix_pattern(body_lower),
         )
         return Finding(
             path=f.path,
@@ -199,13 +169,16 @@ class SourceGroundedFindingVerifier:
         )
 
 
-def _has_fix_pattern(body_lower: str) -> bool:
-    """body (소문자화) 에 fix-pattern 표지가 있으면 True.
+def _has_assertion_hint(body: str) -> bool:
+    """body 에 assertion hint 키워드가 있으면 True — quote 검증 발동 트리거.
 
-    표지가 있으면 "현재값 → 수정안" 형태의 정상 finding 으로 보고 lenient 매칭 적용.
-    `_FIX_PATTERN_HINTS` 에 누적된 표현 중 하나라도 등장하면 발동.
+    한국어 힌트는 단어 경계 개념이 약해 substring 매칭. 영문 힌트는 word-boundary regex
+    매칭 — `namespacing` 안의 `spacing` 같은 부분 매칭으로 검증이 잘못 발동하던 false
+    positive 방지 (codex PR #23 review #5). 영문은 case-insensitive (review #2 도 함께).
     """
-    return any(hint in body_lower for hint in _FIX_PATTERN_HINTS)
+    if any(hint in body for hint in _KOREAN_ASSERTION_HINTS):
+        return True
+    return bool(_ENGLISH_ASSERTION_HINT_RE.search(body))
 
 
 def _read_source_line(

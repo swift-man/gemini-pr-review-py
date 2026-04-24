@@ -285,20 +285,22 @@ def test_verify_keeps_request_changes_when_other_blocking_survives(tmp_path: Pat
     assert out.event == ReviewEvent.REQUEST_CHANGES, "blocking 살아있으면 약화 안 함"
 
 
-# --- Lenient any-match policy (codex PR #23 review #1 회귀 방지) -----------
+# --- Strict-only matching policy (codex PR #23 review #1 → #6 회귀 방지) ----
 
 
-def test_verify_lenient_keeps_finding_when_typo_quote_matches_even_if_fix_does_not(
+def test_verify_strict_downgrades_typo_with_fix_quote_not_in_line(
     tmp_path: Path,
 ) -> None:
-    """정상 typo finding 은 `현재값` `수정안` 두 텍스트를 함께 인용하는 패턴이 흔함.
+    """typo+fix 패턴 (`현재값` → `수정안`) 도 strict 정책에선 강등.
 
-    회귀 방지 (codex PR #23 review #1): 옛 strict 정책 ("any quote NOT in line → 강등")
-    은 수정안이 라인에 없다는 이유로 정당한 typo finding 까지 강등시킴. 새 lenient
-    정책은 인용 중 **하나라도** 라인에 있으면 통과 — 현재값이 라인에 있으니 보존.
+    정책 결정 (codex PR #23 review #4 → #6): lenient 가 phantom + real 혼합 본문을 못
+    잡는 우회로가 됨. fix-pattern hint 로 lenient 발동을 좁히려 했으나 같은 hint 가
+    phantom 본문에서도 등장 가능 → NLP 없이 표면 패턴만으로 구별 불가. **strict only** 로
+    단순화. typo+fix finding 도 강등되지만 본문/원래 등급은 보존돼 사용자가 직접 판단.
 
-    실제 typo `usrname` 이 라인에 있고, 모델이 "`usrname` 을 `username` 으로 수정"
-    이라고 적으면: `username` 은 라인에 없지만 `usrname` 은 있음 → 통과해야 한다.
+    이 테스트는 strict 정책의 직접적 비용 (정당 typo finding false positive) 을 명시.
+    회귀 보호: 누군가 lenient 를 다시 추가하면 이 테스트 의도가 바뀜 — 그 때 codex
+    review #4 의 phantom mixed 우회 회귀도 함께 검토해야 한다는 신호.
     """
     _write(tmp_path, "x.py", "\n" * 4 + 'def hello(usrname):\n')
     finding = Finding(
@@ -309,17 +311,17 @@ def test_verify_lenient_keeps_finding_when_typo_quote_matches_even_if_fix_does_n
 
     out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
 
-    assert out.findings[0].body.startswith("[Critical]"), (
-        "현재값 `usrname` 이 라인에 있으므로 정당한 finding 으로 통과해야 — lenient any-match 정책"
-    )
-    assert "자동 강등" not in out.findings[0].body
+    # `username` (수정안) 이 라인에 없으므로 strict 정책에선 강등
+    assert out.findings[0].body.startswith("[Suggestion]")
+    # 원래 본문과 등급은 보존 — 사용자가 강등 사유 판단 가능
+    assert "원래 [Critical]" in out.findings[0].body
+    assert "usrname" in out.findings[0].body  # 본문 내용 보존
 
 
-def test_verify_lenient_downgrades_when_no_quote_matches_line(tmp_path: Path) -> None:
-    """lenient 정책 검증의 negative side: 인용 모두 라인에 없으면 강등 발동.
+def test_verify_strict_downgrades_when_no_quote_matches_line(tmp_path: Path) -> None:
+    """모든 인용이 라인에 없는 pure phantom case — 강등.
 
-    회귀 방지: lenient 가 너무 관대해져서 phantom case 도 통과시키면 PR #23 의 본 목적을
-    잃는다. 모든 인용이 라인에 없을 때만 강등 발동해야 한다.
+    회귀 방지: 명백한 phantom (모든 인용 거짓) 은 strict 정책의 핵심 타깃.
     """
     _write(tmp_path, "x.py", "\n" * 4 + 'def hello(name):\n')
     finding = Finding(
@@ -456,64 +458,58 @@ def test_verify_strict_downgrades_phantom_quote_mixed_with_real_quote_no_fix_pat
     assert "원래 [Critical]" in out.findings[0].body
 
 
-def test_verify_lenient_keeps_finding_when_fix_pattern_korean_arrow_present(
+# --- English assertion hint word-boundary 매칭 (codex PR #23 review #5) ----
+
+
+def test_verify_does_not_match_substring_of_compound_english_word(
     tmp_path: Path,
 ) -> None:
-    """`→` 같은 fix-pattern 표지가 있으면 lenient 적용 — 현재값 1개만 매치되면 통과.
+    """`namespacing` 같은 단어의 부분 substring `spacing` 에는 검증이 발동하지 않아야 한다.
 
-    회귀 방지: codex review #1 의 정상 typo+fix 패턴은 보호. fix-pattern 표지 인식이
-    빠지면 typo finding 도 strict 에 걸려 강등됨.
+    회귀 방지 (codex PR #23 review #5): 이전엔 영문 hint 가 substring 매칭이라 finding
+    본문이 "use `namespacing` correctly" 같이 정상 코드 권고만 있어도 `spacing` 부분
+    매칭으로 검증 발동 → 모든 인용이 라인에 없으면 강등하던 false positive. word-boundary
+    regex (`\\b`) 로 단어 경계 매칭하면 `namespacing` 안의 `spacing` 은 매치 안 됨.
+
+    이 테스트는 word-boundary regex 가 빠지는 회귀 (다시 substring 매칭으로 돌아가는 경우)
+    를 잡는다.
     """
-    _write(tmp_path, "x.py", "\n" * 4 + "def hello(usrname):\n")
+    _write(tmp_path, "x.py", "\n" * 4 + "x = 1\n")
     finding = Finding(
         path="x.py",
         line=5,
-        body="[Critical] 변수명 오타: `usrname` → `username`",
+        body=(
+            "[Critical] Use proper `namespacing` for the `module_name` to avoid collision."
+        ),
     )
 
     out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
 
+    # `namespacing`/`module_name` 둘 다 라인에 없지만 word-boundary 매칭으로 hint 미감지
+    # → 검증 생략 → finding 그대로 [Critical] 유지.
     assert out.findings[0].body.startswith("[Critical]"), (
-        "`→` fix-pattern 표지 있음 → lenient. `usrname` 매치 → 통과"
+        "`namespacing` 의 substring `spacing` 으로 검증이 잘못 발동하면 안 됨 — "
+        "word-boundary regex 회귀"
     )
 
 
-def test_verify_lenient_keeps_finding_when_fix_pattern_should_be_present(
-    tmp_path: Path,
-) -> None:
-    """영문 fix-pattern (`should be`) 도 lenient 발동."""
-    _write(tmp_path, "x.py", "\n" * 4 + "def hello(usrname):\n")
-    finding = Finding(
-        path="x.py",
-        line=5,
-        body="[Critical] Typo: `usrname` should be `username`",
-    )
+def test_verify_matches_english_hints_with_word_boundary(tmp_path: Path) -> None:
+    """word-boundary 매칭이 정확한 hint 단어는 여전히 잡아야 한다 (negative side).
 
-    out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
-
-    assert out.findings[0].body.startswith("[Critical]"), (
-        "`should be` 표지 → lenient → `usrname` 매치 → 통과"
-    )
-
-
-def test_verify_strict_downgrades_when_no_quote_matches_even_with_fix_pattern(
-    tmp_path: Path,
-) -> None:
-    """fix-pattern 있어도 어떤 인용도 라인에 없으면 강등 — pure phantom 보장.
-
-    회귀 방지: lenient 가 너무 관대해져 fix-pattern 만 있으면 무조건 통과시키면 안 됨.
-    적어도 하나는 라인에 있어야 (현재값) lenient 통과 발동. 모두 phantom 이면 fix-pattern
-    유무와 무관하게 강등.
+    회귀 방지: word-boundary 강화로 진짜 hint (단독 `whitespace`, `Whitespace`,
+    `whitespace.` 등) 도 못 잡으면 본 검증 자체가 무력. 적어도 정확한 단어 형태는
+    case-insensitive 로 잡혀야.
     """
-    _write(tmp_path, "x.py", "\n" * 4 + "def hello(name):\n")  # `usrname` 도 없음
+    _write(tmp_path, "x.py", "\n" * 4 + "def f(x):\n")
     finding = Finding(
         path="x.py",
         line=5,
-        body="[Critical] Typo: `usrname` → `username`",  # 둘 다 라인에 없음
+        body="[Critical] Whitespace issue: `\" leading\"` should not be there.",
     )
 
     out = SourceGroundedFindingVerifier().verify(_result(finding), tmp_path)
 
+    # `Whitespace` (단독, 대문자 시작) hint 인식 + 인용 라인에 없음 → 강등
     assert out.findings[0].body.startswith("[Suggestion]"), (
-        "fix-pattern 있어도 모든 인용이 라인에 없으면 강등 (pure phantom)"
+        "단독 영문 hint 단어 (case-insensitive) 는 여전히 매칭돼야"
     )
