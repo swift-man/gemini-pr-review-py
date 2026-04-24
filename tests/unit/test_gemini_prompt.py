@@ -215,3 +215,29 @@ def test_prompt_contains_path_grounding_and_severity_discipline() -> None:
     assert "확신이 낮은 지적" in prompt or "확신 낮으면" in prompt
     # 실관측 escape 환각 표현 인용 — 모델이 같은 표현을 안 답습하도록
     assert "리터럴 'n'" in prompt or "리터럴 \"n\"" in prompt
+
+
+def test_prompt_warns_against_phantom_whitespace_and_false_ci_failure() -> None:
+    """Phantom whitespace / false CI failure 환각 차단 섹션 존재 + 핵심 키워드 검증.
+
+    회귀 방지 (사용자 신고 사례 5, 2026-04): swift-man/MaterialDesignColor PR #7 등에서
+    `"@scope"` 같은 인용을 모델이 `" @scope"` 로 잘못 토큰화해 "원본에 공백 있다" 단언,
+    같은 commit CI 가 SUCCESS 인 변경에 "command not found" 단언 등 환각 반복. 프롬프트에
+    구체 anti-pattern 과 자동 강등 키워드가 명시돼 있어야 같은 환각 답습 방지.
+    """
+    dump = FileDump(entries=(), total_chars=0)
+    prompt = build_prompt(_pr(), dump)
+
+    # 새 환각 카테고리 섹션 헤더
+    assert "Phantom 공백" in prompt or "phantom whitespace" in prompt.lower()
+    # 토큰화 아티팩트 메커니즘 설명 — 모델이 자기 환각의 원인을 인지하도록
+    assert "토큰화" in prompt
+    # 실관측 환각 패턴 인용 (모델이 같은 표현 답습 금지)
+    assert "패키지명 앞에 불필요한 공백" in prompt
+    assert "띄어쓰기 오타" in prompt
+    # CI SUCCESS 케이스의 false 실패 단언 금지 명시
+    assert "command not found" in prompt
+    assert "CI" in prompt and ("즉시 실패" in prompt or "SUCCESS" in prompt)
+    # 자동 강등 키워드 명시 (파서 동작과 일치)
+    assert "자동 강등" in prompt
+    assert "불필요한 공백" in prompt

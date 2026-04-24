@@ -351,6 +351,95 @@ def test_parse_does_not_downgrade_minor_or_suggestion() -> None:
     assert all("자동 강등" not in f.body for f in result.findings)
 
 
+# --- Phantom whitespace / CI 실패 환각 (사용자 신고 사례 5, 2026-04 추가) ---
+
+
+def test_parse_downgrades_critical_on_phantom_whitespace_assertion(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`불필요한 공백` 단언이 [Critical]/[Major] 본문에 있으면 [Suggestion] 강등.
+
+    실관측 회귀 (사용자 신고 사례 5): swift-man/MaterialDesignColor PR #7 README.md:120
+    에서 모델이 `"@swift-man/material-design-color"` 인용을 `" @swift-man/..."` 로 잘못
+    토큰화하고, 이를 거꾸로 "원본에 공백 있음" 으로 단언. 같은 PR 의 3회 연속 push 에
+    대해 동일 환각 반복. 메인테이너가 매번 `awk '{print "[" $0 "]"}'` 로 라인 검증해야
+    하는 alert fatigue 발생.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "REQUEST_CHANGES",
+      "comments": [
+        {"path": "README.md", "line": 120, "body": "[Major] 예제 코드의 패키지명 앞에 불필요한 공백이 포함되어 있습니다."}
+      ]
+    }
+    """
+    with caplog.at_level(logging.WARNING):
+        result = parse_review(raw)
+
+    assert len(result.findings) == 1
+    body = result.findings[0].body
+    assert body.startswith("[Suggestion]"), "phantom whitespace 단언은 강등돼야"
+    assert "원래 [Major]" in body, "원래 등급이 보존돼야 silent rewrite 방지"
+    downgrade_warns = [r for r in caplog.records if "downgrading severity" in r.getMessage()]
+    assert len(downgrade_warns) == 1
+
+
+def test_parse_downgrades_critical_on_phantom_typo_assertion() -> None:
+    """`띄어쓰기 오타` 단언도 같은 환각 카테고리 — 강등 대상.
+
+    실관측 회귀: swift.yml:29 의 `npx --package typescript@5.4.5` (공백 0) 에 대해
+    "공백 있어서 CI 즉시 실패" 단언. 같은 commit 의 CI 는 SUCCESS — 검증 가능한 거짓.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "REQUEST_CHANGES",
+      "comments": [
+        {"path": ".github/workflows/swift.yml", "line": 29, "body": "[Critical] npx 명령어에 띄어쓰기 오타가 있습니다."}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.findings[0].body.startswith("[Suggestion]")
+    assert "원래 [Critical]" in result.findings[0].body
+
+
+def test_parse_downgrades_critical_on_false_command_not_found_assertion() -> None:
+    """`command not found` 단언 환각 — CI 가 SUCCESS 인 변경에 대한 거짓 실패 단언.
+
+    회귀 방지: 같은 사용자 신고에서, 정상 `typescript@5.4.5` 명령에 대해 "shell 이
+    `@5.4.5` 를 binary 로 해석해 command not found" 라고 단언. 검증 가능한 거짓.
+    """
+    raw = """
+    {
+      "summary": "ok",
+      "event": "REQUEST_CHANGES",
+      "comments": [
+        {"path": ".github/workflows/swift.yml", "line": 29,
+         "body": "[Critical] CI 가 command not found 로 즉시 실패합니다."}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.findings[0].body.startswith("[Suggestion]")
+
+
+def test_parse_downgrades_critical_on_immediate_failure_assertion() -> None:
+    """`즉시 실패` 단언 환각 — 검증 안 된 강한 실패 주장."""
+    raw = """
+    {
+      "summary": "ok",
+      "event": "REQUEST_CHANGES",
+      "comments": [
+        {"path": "x.yml", "line": 1, "body": "[Major] 이 변경으로 CI 빌드가 즉시 실패합니다."}
+      ]
+    }
+    """
+    result = parse_review(raw)
+    assert result.findings[0].body.startswith("[Suggestion]")
+
+
 # --- Event normalization (REQUEST_CHANGES weakening) -----------------------
 
 
