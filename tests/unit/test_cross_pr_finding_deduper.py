@@ -291,6 +291,78 @@ def test_dedupe_graceful_degrade_on_api_error(caplog: pytest.LogCaptureFixture) 
 # --- 시그니처 정규화 details -------------------------------------------------
 
 
+def test_dedupe_matches_against_previously_auto_demoted_history_layer_d() -> None:
+    """3 회차+ 회귀 방지: Layer D 가 이전에 강등한 [Suggestion] 본문도 dedup 시그니처에서 매칭.
+
+    회귀 방지 (codex PR #25 review #1): _normalize_body_for_match 가 severity prefix 만
+    떼고 자동 강등 prefix 를 그대로 두면 다음 시나리오가 깨졌다.
+
+    1 회차: 모델 `[Major] phantom 본문` → history 기록.
+    2 회차: 모델 `[Major] phantom 본문` 다시 → dedup 발동 → `[Suggestion]
+            (자동 강등: 이전 push 에서 동일 지적이 이미 게시됨 ..., 원래 [Major])
+            phantom 본문` 게시 → 이게 history 에 남음.
+    3 회차: 모델 `[Major] phantom 본문` 또 다시 → 이전 history 코멘트의 시그니처가
+            `(자동 강등: ..., 원래 [Major]) phantom 본문` (prefix 안 떨어짐) → 새
+            finding 의 시그니처 `phantom 본문` 과 다름 → match 실패 → dedup 무력화.
+
+    이제는 _AUTO_DEMOTE_PREFIX 가 prefix 를 떼므로 시그니처가 `phantom 본문` 으로 동일,
+    3 회차+ 도 안정 강등.
+    """
+    existing = (
+        # 2 회차 dedup 결과 게시된 본문 — 자동 강등 prefix 포함
+        PostedReviewComment(
+            path="README.md",
+            line=120,
+            body=(
+                "[Suggestion] (자동 강등: 이전 push 에서 동일 지적이 이미 게시됨 — "
+                "메인테이너가 무시한 것으로 판단됨, 원래 [Major]) phantom 공백 본문."
+            ),
+        ),
+    )
+    # 3 회차 push 의 새 finding — 모델은 또 원본 형태로 단언
+    new_finding = Finding(
+        path="README.md", line=120, body="[Major] phantom 공백 본문."
+    )
+
+    out = CrossPrFindingDeduper(_FakeGitHub(existing)).dedupe(_result(new_finding), _pr())
+
+    assert out.findings[0].body.startswith("[Suggestion]"), (
+        "3 회차 dedup: history 에 자동 강등본만 있어도 새 [Major] 가 강등돼야"
+    )
+    assert "원래 [Major]" in out.findings[0].body, (
+        "3 회차 강등도 원래 등급은 [Major] (history 의 '원래 [Major]' 가 아니라 새 finding 의 등급)"
+    )
+
+
+def test_dedupe_matches_against_previously_layer_b_demoted_history() -> None:
+    """Layer B 강등 본문도 dedup 매칭 — 출처 검증으로 강등된 phantom 도 history grounding 통과.
+
+    시나리오: Layer B (verifier) 가 1 회차에 phantom-quote 강등 → 2 회차 모델이 같은
+    단언 다시 → Layer D 가 history 의 Layer-B-강등본과 매칭해 또 강등. 두 layer 의
+    강등 prefix 가 모두 정규화에서 떨어져야 함.
+    """
+    existing = (
+        PostedReviewComment(
+            path="README.md",
+            line=120,
+            body=(
+                "[Suggestion] (자동 강등: 인용 텍스트 `\" @scope\"` 등이 README.md:120 의 "
+                "실제 라인에 없음 — phantom quote 환각 가능성, 원래 [Major]) "
+                "패키지명 앞에 공백."
+            ),
+        ),
+    )
+    new_finding = Finding(
+        path="README.md", line=120, body="[Major] 패키지명 앞에 공백."
+    )
+
+    out = CrossPrFindingDeduper(_FakeGitHub(existing)).dedupe(_result(new_finding), _pr())
+
+    assert out.findings[0].body.startswith("[Suggestion]"), (
+        "Layer B 강등본 history 와 새 [Major] 매칭돼 dedup 강등돼야"
+    )
+
+
 def test_dedupe_matches_when_only_whitespace_padding_differs() -> None:
     """양끝 공백/줄바꿈은 strip 으로 정규화 — 사소한 형식 차이로 dedup 우회 못 하도록."""
     existing = (
