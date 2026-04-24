@@ -242,3 +242,28 @@ def test_prompt_warns_against_phantom_whitespace_and_false_ci_failure() -> None:
     assert "SourceGroundedFindingVerifier" in prompt or "후처리" in prompt
     # backtick 인용 권장 — verifier 가 정확히 매칭하도록 raw line 인용 유도
     assert "백틱" in prompt or "backtick" in prompt
+
+
+def test_phantom_examples_use_unambiguous_wrong_vs_real_labels() -> None:
+    """❌ 잘못된 환각 / ✅ 실제 소스 라인 레이블이 모든 phantom 예시에 짝지어 등장.
+
+    회귀 방지 (gemini PR #22 review): 이전 버전은 `❌` 와 `←` 만으로 wrong-vs-real 을
+    구분했는데, 리뷰 봇 자체가 phantom 주장 줄과 실제 소스 줄을 혼동해서 "실제 라인에
+    공백이 있다" 는 오류 보고를 남겼다. 모델 reading path 도 같은 모호함에 노출됨.
+    명시적인 `잘못된 환각:` / `실제 소스 라인:` 레이블로 구조를 시각적으로 못 박는다.
+
+    각 phantom 사례는 ❌ + ✅ 한 쌍 — 개수가 일치해야 짝이 맞는다. 한쪽만 늘어나면
+    해석이 깨진다.
+    """
+    dump = FileDump(entries=(), total_chars=0)
+    prompt = build_prompt(_pr(), dump)
+
+    wrong_count = prompt.count("❌ 잘못된 환각:")
+    real_count = prompt.count("✅ 실제 소스 라인:")
+    assert wrong_count >= 2, (
+        f"phantom 사례 ❌ 라벨이 2건 이상 있어야 (관측 사례). 실제 {wrong_count}건"
+    )
+    assert wrong_count == real_count, (
+        f"❌ ({wrong_count}) 와 ✅ ({real_count}) 개수가 같아야 짝이 맞음 — 한쪽만 늘면"
+        " phantom/real 짝짓기 해석이 깨진다"
+    )
