@@ -44,10 +44,16 @@ def addable_lines_from_patch(patch: str | None) -> set[int]:
                 # hunk 시작 직전 위치로 세팅. 첫 번째 +/space 라인을 만나면 +1 되어
                 # 정확한 시작 라인 번호가 된다.
                 new_line_no = int(match.group(1)) - 1
-        elif line.startswith("+++") or line.startswith("---"):
-            # diff 헤더 라인 (`+++ b/path`, `--- a/path`) — 본문 아님.
+        elif line.startswith("+++ ") or line.startswith("--- "):
+            # diff 파일 헤더 (`+++ b/path`, `--- a/path`, `+++ /dev/null`) — 본문 아님.
+            # **trailing space 까지 매칭** (codex PR #26 review #5): 공백 없는 `+++X`/`---X`
+            # 는 content (`++X`/`--X` 가 +/- diff marker 와 만난 형태) 로 처리해야 함.
+            # 예: JS `++counter` 추가 → diff line `+++counter` 는 본문 추가 라인이지
+            # file header 가 아님. 이전 `startswith("+++")` 만 검사하면 RIGHT 라인
+            # 카운터가 안 증가해 후속 addable 가 모두 -1 어긋남 → 422 회귀.
             # `+++` 가 `+` 보다 먼저 검사돼야 아래 분기에서 헤더가 추가 라인으로 잘못
-            # 분류되지 않는다 (순서 의존성).
+            # 분류되지 않는다 (순서 의존성). content `+++X` 는 trailing space 가 없어
+            # 이 분기에서 fall-through 후 `+/space` 분기로 정상 처리됨.
             continue
         elif line.startswith(("+", " ")):
             # 추가(`+`) 와 hunk 안 context(` `) 모두 RIGHT 사이드에 존재하므로
@@ -95,8 +101,9 @@ def format_patch_with_line_numbers(patch: str | None) -> str:
                 # hunk 시작 직전 위치 — 첫 +/space 라인을 만나면 +1 되어 정확한 시작 번호.
                 new_line_no = int(match.group(1)) - 1
             continue
-        if line.startswith("+++") or line.startswith("---"):
-            # diff 헤더 (file path) — 본문 아님. addable 계산과 동일한 우선 검사.
+        if line.startswith("+++ ") or line.startswith("--- "):
+            # diff 파일 헤더 — addable 계산과 동일 규칙 (codex PR #26 review #5).
+            # trailing space 매칭으로 `+++X`/`---X` content 와 구분.
             out.append(line)
             continue
         if line.startswith(("+", " ")):
