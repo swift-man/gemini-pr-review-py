@@ -201,7 +201,11 @@ class FileDumpCollector:
         ordered = _sort_by_priority(tracked, changed_set)
 
         entries: list[FileEntry] = []
-        excluded: list[str] = []
+        # 의도적 필터 제외 (binary, lock, image 등) 와 예산 cut 을 분리 추적.
+        # 이 둘을 한 리스트로 묶으면 이미지 1개만 변경된 PR 도 `_changed_missing` 판정이
+        # True 가 되어 강제 fallback 으로 빠지는 회귀 (gemini PR #26 review #3).
+        filtered_out: list[str] = []
+        budget_excluded: list[str] = []
         total_chars = 0
         max_chars = budget.max_chars()
 
@@ -215,19 +219,24 @@ class FileDumpCollector:
                 self._file_max_bytes,
                 self._data_file_max_bytes,
             ):
-                excluded.append(rel_path)
+                # 의도된 필터 제외 — review 대상 자체가 아님 (binary/lock/image/fixture).
+                filtered_out.append(rel_path)
                 continue
             try:
                 content = abs_path.read_text(encoding="utf-8")
             except (UnicodeDecodeError, OSError):
-                excluded.append(rel_path)
+                # read 실패 (UnicodeDecodeError, 권한, 디바이스 등) 는 의도된 제외와
+                # 비슷하게 "review 불가" 케이스 — 예산 부족 신호와 다르므로 filtered_out.
+                filtered_out.append(rel_path)
                 continue
 
             # 32자 여유는 프롬프트에 붙는 "--- FILE: path ---" / 라인 번호 접두사 등
             # 프레이밍 오버헤드 근사치. 정확한 토큰 산정은 아니지만 보수적으로 잡아 예산 초과를 막는다.
             entry_chars = len(content) + len(rel_path) + 32
             if total_chars + entry_chars > max_chars:
-                excluded.append(rel_path)
+                # 예산 cut — 원래 review 대상이지만 들어갈 자리 없음. 변경 파일이 여기
+                # 들어가면 `_changed_missing` 가 True 가 되어 fallback 발동.
+                budget_excluded.append(rel_path)
                 continue
 
             entries.append(
@@ -240,18 +249,27 @@ class FileDumpCollector:
             )
             total_chars += entry_chars
 
-        # exceeded 판정 기준:
-        # (1) 변경 파일 중 하나라도 예산 때문에 제외됐다면 → 리뷰 품질이 크게 떨어지므로 exceeded
-        # (2) 전체 예산을 꽉 채웠다면(>=)  → 프롬프트 뒤쪽이 잘렸을 가능성 높음
-        # use case 레이어에서 (1)에 해당하는 경우에만 리뷰 대신 "예산 초과" 코멘트를 게시.
-        exceeded = any(p for p in excluded if p in changed_set) or total_chars >= max_chars
+        # exceeded 판정 기준 (gemini PR #26 review #3 후 정정):
+        # (1) 변경 파일 중 하나라도 **예산 때문에** 제외됐다면 → 리뷰 품질 저하 → exceeded
+        # (2) 전체 예산을 꽉 채웠다면 → 프롬프트 뒤쪽이 잘렸을 가능성 → exceeded
+        # 필터 제외만 있는 경우 (이미지 변경 PR 등) 는 budget 와 무관 → False.
+        exceeded = (
+            any(p in changed_set for p in budget_excluded)
+            or total_chars >= max_chars
+        )
+
+        # 사용자 노출용 combined excluded — notice 메시지는 두 종류 다 보여줌이 자연스럽다.
+        excluded = filtered_out + budget_excluded
 
         # 관측성: 필터 효과를 매 리뷰마다 한 줄로 남긴다. 토큰 예산 튜닝/Tier 2 필터
-        # 추가 판단에 근거 자료로 쓴다.
+        # 추가 판단에 근거 자료로 쓴다. filter / budget 분리 카운트로 어떤 차원이 지배적
+        # 인지 즉시 파악 가능.
         logger.info(
-            "file dump: included=%d excluded=%d chars=%d/%d (%.1f%%) exceeded=%s",
+            "file dump: included=%d filtered_out=%d budget_excluded=%d "
+            "chars=%d/%d (%.1f%%) exceeded=%s",
             len(entries),
-            len(excluded),
+            len(filtered_out),
+            len(budget_excluded),
             total_chars,
             max_chars,
             100.0 * total_chars / max_chars if max_chars else 0.0,
@@ -262,6 +280,8 @@ class FileDumpCollector:
             entries=tuple(entries),
             total_chars=total_chars,
             excluded=tuple(excluded),
+            filtered_out=tuple(filtered_out),
+            budget_excluded=tuple(budget_excluded),
             exceeded_budget=exceeded,
             budget=budget,
         )

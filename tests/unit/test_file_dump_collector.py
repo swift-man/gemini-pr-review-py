@@ -184,3 +184,47 @@ def test_package_resolved_is_skipped(repo: Path) -> None:
     collector = FileDumpCollector(file_max_bytes=1024 * 1024)
     dump = collector.collect(repo, changed_files=(), budget=TokenBudget(10_000))
     assert "Package.resolved" not in [e.path for e in dump.entries]
+
+
+# --- filter-cut vs budget-cut 분리 (gemini PR #26 review #3) -----------------
+
+
+def test_collect_distinguishes_filter_cut_from_budget_cut(repo: Path) -> None:
+    """필터 제외 (이미지/lock) 와 예산 cut 을 분리 보고 — exceeded_budget 오판 방지.
+
+    회귀 방지 (gemini PR #26 review #3): 이전엔 두 종류 제외를 한 `excluded` 리스트에
+    묶어 둬서, 이미지 1개만 변경된 PR 도 `exceeded_budget=True` + `_changed_missing=True`
+    로 판정돼 강제 fallback 경로로 빠졌다. 이제는 dump 가 `filtered_out` 와
+    `budget_excluded` 를 분리해 use case 가 진짜 budget 신호만 fallback 트리거로 사용.
+    """
+    collector = FileDumpCollector(file_max_bytes=1024)
+    dump = collector.collect(
+        repo, changed_files=("logo.png",), budget=TokenBudget(10_000)
+    )
+
+    # 이미지 변경 PR — 필터 제외 O, 예산 cut X → exceeded_budget = False
+    assert "logo.png" in dump.filtered_out, "이미지는 필터 제외로 분류돼야"
+    assert "logo.png" not in dump.budget_excluded, "예산 cut 아님"
+    assert dump.exceeded_budget is False, (
+        "필터 제외만으로는 exceeded_budget 발동 안 함 — 강제 fallback 회귀 방지"
+    )
+    # backward-compat: 사용자 노출용 combined excluded 는 둘 다 포함
+    assert "logo.png" in dump.excluded
+
+
+def test_collect_marks_budget_cut_when_changed_file_exceeds(repo: Path) -> None:
+    """변경 파일이 예산 부족으로 잘리면 budget_excluded + exceeded_budget=True.
+
+    회귀 방지: filter-cut 과 분리한 후에도 진짜 예산 cut 은 여전히 fallback 트리거여야.
+    """
+    (repo / "big.py").write_text("x\n" * 5000, encoding="utf-8")
+    _commit_all(repo)
+
+    collector = FileDumpCollector(file_max_bytes=1024 * 1024)
+    dump = collector.collect(
+        repo, changed_files=("big.py",), budget=TokenBudget(max_tokens=1)
+    )
+
+    assert "big.py" in dump.budget_excluded, "예산 부족은 budget_excluded 로 분류"
+    assert "big.py" not in dump.filtered_out, "필터 제외 아님 (.py 는 필터 통과)"
+    assert dump.exceeded_budget is True, "변경 파일 budget cut → fallback 트리거"

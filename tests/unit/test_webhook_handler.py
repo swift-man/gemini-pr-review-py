@@ -333,6 +333,52 @@ def test_use_case_falls_back_to_diff_review_when_budget_exceeded_with_patches(
     assert github.posted_reviews[0][1] is expected, "diff review 결과가 그대로 게시돼야"
 
 
+def test_use_case_does_not_fallback_when_only_filter_cut_changed_files(
+    tmp_path: Path,
+) -> None:
+    """이미지/lock 같은 의도된 필터 제외 파일만 변경된 PR 은 강제 fallback 으로 빠지면 안 됨.
+
+    회귀 방지 (gemini PR #26 review #3): 이전엔 dump 의 `excluded` 가 filter + budget
+    cut 을 구분 없이 담고 `_changed_missing` 가 단순 `cf not in entries` 검사라, 이미지
+    1개만 변경된 PR 도 `exceeded_budget=True` + `_changed_missing=True` 로 판정돼 강제
+    diff fallback 으로 빠짐. 이제는 dump.filtered_out 가 분리 보고되어 use case 의
+    `_changed_missing` 가 의도된 필터 제외를 missing 신호로 카운트하지 않음.
+
+    이 테스트는 변경 파일이 모두 filtered_out 에 있고 budget_excluded 가 비었다는 상황
+    → exceeded_budget=False → 일반 review 경로 (fallback 진입 자체 안 함).
+    """
+    github = FakeGitHub()
+    pr = _sample_pr()  # changed_files=("a.py",)
+    # 변경 파일이 필터로 제외됐다고 시뮬레이션 (FileDumpCollector 가 만드는 상태)
+    dump = FileDump(
+        entries=(),
+        total_chars=0,
+        excluded=("a.py",),
+        filtered_out=("a.py",),  # 필터 제외만 — 예산 cut 아님
+        budget_excluded=(),
+        exceeded_budget=False,  # filter-only 는 budget 신호가 아님
+        budget=TokenBudget(1000),
+    )
+    expected = ReviewResult(summary="normal-review", event=ReviewEvent.COMMENT)
+    engine = FakeEngine(expected)
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=engine,
+        finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
+        max_input_tokens=1000,
+    )
+
+    use_case.execute(pr)
+
+    assert engine.diff_calls == [], "필터 제외만이면 diff fallback 진입 X"
+    assert github.posted_comments == [], "예산 초과 notice 게시 X"
+    assert len(github.posted_reviews) == 1, "일반 review 경로 통과"
+    assert github.posted_reviews[0][1] is expected
+
+
 def test_use_case_size_check_uses_full_prompt_not_just_diff_text(
     tmp_path: Path,
 ) -> None:

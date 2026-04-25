@@ -147,8 +147,19 @@ class ReviewPullRequestUseCase:
 
 
 def _changed_missing(pr: PullRequest, dump: FileDump) -> bool:
+    """변경 파일 중 **예산 부족으로** 누락된 파일이 있는지 — fallback 발동의 진짜 트리거.
+
+    회귀 방지 (gemini PR #26 review #3): 이전엔 `cf not in entries` 만 검사해 의도된
+    필터 제외 파일 (binary, lock, image — 애초에 review 대상 아님) 도 "missing 신호" 로
+    카운트. 그 결과 이미지 1개만 변경된 PR 도 강제 fallback 으로 빠짐. 이제는 dump 가
+    `filtered_out` (의도된 제외) 와 `budget_excluded` (예산 cut) 를 분리 보고하므로,
+    필터 제외는 missing 판정에서 빼고 budget cut 만 트리거로 사용.
+    """
     included = {e.path for e in dump.entries}
-    return any(cf not in included for cf in pr.changed_files)
+    filtered = set(dump.filtered_out)
+    return any(
+        cf not in included and cf not in filtered for cf in pr.changed_files
+    )
 
 
 def _budget_exceeded_message(pr: PullRequest, dump: FileDump) -> str:
