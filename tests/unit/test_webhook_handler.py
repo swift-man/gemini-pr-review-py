@@ -297,6 +297,57 @@ def test_use_case_posts_comment_when_budget_exceeded_and_no_diff_available(
     assert "예산 초과" in github.posted_comments[0][1]
 
 
+def test_use_case_runs_resolution_check_even_when_budget_fallback_aborts(
+    tmp_path: Path,
+) -> None:
+    """예산 초과로 새 리뷰 못 남기는 경우에도 prior 코멘트의 resolution check 는 실행돼야.
+
+    회귀 방지 (gemini PR #28 review #2): 이전 구현은 `result is None` 일 때 일찍
+    `return` → `check_resolutions` skip. 메인테이너가 이전 push 의 코멘트 라인을 이미
+    수정했을 수 있는데 새 리뷰 게시 실패와 맞물려 follow-up 추적까지 잃는 회귀.
+    이제는 try/finally 로 보장 — 새 리뷰 못 남겨도 prior 코멘트 추적은 계속.
+    """
+
+    class _RecordingResolutionChecker:
+        def __init__(self) -> None:
+            self.call_count = 0
+
+        def check_resolutions(self, pr: PullRequest, repo_root: Path) -> None:
+            self.call_count += 1
+
+    github = FakeGitHub()
+    pr = _sample_pr()  # file_patches=() default → diff fallback 도 빈 diff 로 실패
+    dump = FileDump(
+        entries=(),
+        total_chars=0,
+        excluded=("a.py",),
+        budget_excluded=("a.py",),
+        exceeded_budget=True,
+        budget=TokenBudget(1),
+    )
+    resolver = _RecordingResolutionChecker()
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=FakeEngine(ReviewResult(summary="x", event=ReviewEvent.COMMENT)),
+        finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
+        resolution_checker=resolver,
+        max_input_tokens=1,
+    )
+
+    use_case.execute(pr)
+
+    # 새 리뷰는 안 게시됐지만 (notice 만)...
+    assert github.posted_reviews == []
+    assert len(github.posted_comments) == 1
+    # prior 코멘트 resolution check 는 여전히 실행돼야 — try/finally 보장
+    assert resolver.call_count == 1, (
+        "budget exceeded + diff fallback 실패해도 resolution check 는 호출돼야"
+    )
+
+
 def test_use_case_falls_back_to_diff_review_when_budget_exceeded_with_patches(
     tmp_path: Path,
 ) -> None:

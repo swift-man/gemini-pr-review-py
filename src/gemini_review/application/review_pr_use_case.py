@@ -57,34 +57,42 @@ class ReviewPullRequestUseCase:
         #   2) diff fallback (변경 파일이 잘려 나감 + diff 가 비어 있지 않고 budget 안) —
         #      `engine.review_diff(pr, diff_text)`
         #   3) notice (diff 도 비었거나 너무 큼) — `_budget_exceeded_message`
-        if dump.exceeded_budget and _changed_missing(pr, dump):
-            result = self._fallback_to_diff_review(pr, dump)
-            if result is None:
-                return
-        else:
-            logger.info(
-                "reviewing %s#%d — files=%d chars=%d excluded=%d",
-                pr.repo.full_name,
-                pr.number,
-                len(dump.entries),
-                dump.total_chars,
-                len(dump.excluded),
-            )
-            result = self._engine.review(pr, dump)
-        # Layer B — 출처 grounding: 모델이 본문에 인용한 텍스트가 실제 소스 라인에 존재
-        # 하는지 디스크 레벨로 확인. phantom quote 환각 (예: 모델이 `"@scope"` 를
-        # `" @scope"` 로 잘못 토큰화 → "원본에 공백" 단언) 을 [Suggestion] 으로 강등.
-        result = self._finding_verifier.verify(result, repo_path)
-        # Layer D — history grounding: 같은 PR 의 이전 push 에서 본 봇이 이미 게시했던
-        # 동일 [Critical]/[Major] finding 은 메인테이너가 무시한 신호로 보고 [Suggestion]
-        # 으로 강등. 4 회 연속 push 동일 phantom 코멘트 같은 alert fatigue 방어.
-        result = self._finding_deduper.dedupe(result, pr)
-        self._github.post_review(pr, result)
-        # Layer E — follow-up: 본 봇이 이전 push 에서 단 차단급 코멘트 중 라인이
-        # 새 push 에서 변경된 것에 대해 부모 thread 에 "수정 확인 요청" 대댓글을
-        # 게시. side effect 만 (반환 없음), 어떤 실패도 이미 끝난 post_review 에
-        # 영향 X (graceful degrade).
-        self._resolution_checker.check_resolutions(pr, repo_path)
+        # Layer E (resolution check) 는 새 리뷰를 못 남겨도 (budget exceeded + diff
+        # fallback 도 실패) 항상 호출. 메인테이너가 이전 push 의 코멘트 라인을 이미
+        # 수정했을 수 있고, 그 신호는 이번 push 의 새 리뷰 게시 여부와 독립적이다
+        # (gemini PR #28 review #2). try/finally 로 보장.
+        try:
+            if dump.exceeded_budget and _changed_missing(pr, dump):
+                result = self._fallback_to_diff_review(pr, dump)
+                if result is None:
+                    return
+            else:
+                logger.info(
+                    "reviewing %s#%d — files=%d chars=%d excluded=%d",
+                    pr.repo.full_name,
+                    pr.number,
+                    len(dump.entries),
+                    dump.total_chars,
+                    len(dump.excluded),
+                )
+                result = self._engine.review(pr, dump)
+            # Layer B — 출처 grounding: 모델이 본문에 인용한 텍스트가 실제 소스 라인에
+            # 존재하는지 디스크 레벨로 확인. phantom quote 환각 (예: 모델이 `"@scope"` 를
+            # `" @scope"` 로 잘못 토큰화 → "원본에 공백" 단언) 을 [Suggestion] 으로 강등.
+            result = self._finding_verifier.verify(result, repo_path)
+            # Layer D — history grounding: 같은 PR 의 이전 push 에서 본 봇이 이미 게시
+            # 했던 동일 [Critical]/[Major] finding 은 메인테이너가 무시한 신호로 보고
+            # [Suggestion] 으로 강등. 4 회 연속 push 동일 phantom 코멘트 같은 alert
+            # fatigue 방어.
+            result = self._finding_deduper.dedupe(result, pr)
+            self._github.post_review(pr, result)
+        finally:
+            # Layer E — follow-up: 본 봇이 이전 push 에서 단 차단급 코멘트 중 라인이
+            # 새 push 에서 변경된 것에 대해 부모 thread 에 "수정 확인 요청" 대댓글을
+            # 게시. side effect 만 (반환 없음), 어떤 실패도 이미 끝난 post_review 에
+            # 영향 X (graceful degrade). budget-exceeded 조기 return 경로에서도 prior
+            # 코멘트 추적은 여전히 가치 있으므로 finally 로 보장.
+            self._resolution_checker.check_resolutions(pr, repo_path)
 
 
     def _fallback_to_diff_review(
