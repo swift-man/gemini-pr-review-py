@@ -301,6 +301,9 @@ def test_use_case_falls_back_to_diff_review_when_budget_exceeded_with_patches(
         installation_id=7,
         is_draft=False,
         file_patches=(("a.py", "@@ -1,1 +1,2 @@\n a\n+B\n"),),
+        # _fetch_files_for_pr 가 같은 /files 응답에서 둘 다 채우는 흐름 모사
+        # (gemini PR #26 review #7: assemble_pr_diff 가 캐시 lookup).
+        addable_lines=(("a.py", frozenset({1, 2})),),
     )
     # 예산은 SYSTEM_RULES (~5KB) + DIFF_MODE_NOTICE + PR 메타 + diff 본문 합쳐 들어갈
     # 만큼. 50000 tokens = 200000 chars 로 작은 diff 테스트는 여유롭게 통과.
@@ -461,6 +464,7 @@ def test_use_case_size_check_uses_full_prompt_not_just_diff_text(
         is_draft=False,
         # raw patch 는 소량 (~50 chars)
         file_patches=(("a.py", "@@ -1,1 +1,1 @@\n-x\n+y\n"),),
+        addable_lines=(("a.py", frozenset({1})),),  # +y 는 RIGHT 1
     )
     # SYSTEM_RULES 만 ~5KB. token=500 (= 2000 chars) 면 SYSTEM_RULES 도 못 담음 →
     # diff_text 본문 길이 (50 chars 미만) 만 검사하던 이전 로직은 이 케이스를 통과시켜
@@ -519,6 +523,8 @@ def test_use_case_posts_notice_when_diff_itself_too_large(
         installation_id=7,
         is_draft=False,
         file_patches=(("big.py", huge_patch),),
+        # huge_patch: `@@ -1,1 +1,1 @@\n` + ("+x\n" * 5000) → RIGHT 1..5000
+        addable_lines=(("big.py", frozenset(range(1, 5001))),),
     )
     dump = FileDump(
         entries=(),

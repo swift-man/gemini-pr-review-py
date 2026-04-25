@@ -535,6 +535,7 @@ def test_review_diff_invokes_with_diff_prompt_and_returns_parsed_result(
         installation_id=7,
         is_draft=False,
         file_patches=(("src/a.py", "@@ -1,1 +1,2 @@\n a\n+B\n"),),
+        addable_lines=(("src/a.py", frozenset({1, 2})),),
     )
     diff_text = "--- FILE: src/a.py ---\n@@ -1,1 +1,2 @@\n      1|  a\n      2| +B\n--- END FILE ---"
 
@@ -605,6 +606,12 @@ def test_review_diff_drops_findings_on_files_excluded_from_diff_input(
             ("kept.py", "@@ -1,1 +1,2 @@\n a\n+B\n"),
             ("deleted.py", "@@ -1,3 +0,0 @@\n-old1\n-old2\n-old3\n"),
         ),
+        # addable_lines 도 같이 채워야 paths_in_pr_diff 캐시 lookup 동작 (gemini PR #26
+        # review #7). deleted.py 는 RIGHT 라인 0 → 빈 frozenset.
+        addable_lines=(
+            ("kept.py", frozenset({1, 2})),
+            ("deleted.py", frozenset()),
+        ),
     )
     result = GeminiCliEngine(binary="gemini", model="gemini-2.5-pro").review_diff(
         pr, "stub diff"
@@ -655,6 +662,7 @@ def test_review_diff_falls_back_through_models_on_capacity_failure(
         installation_id=7,
         is_draft=False,
         file_patches=(("a.py", "@@ -1,1 +1,1 @@\n-x\n+y\n"),),
+        addable_lines=(("a.py", frozenset({1})),),
     )
     result = GeminiCliEngine(
         binary="gemini",

@@ -271,6 +271,9 @@ def test_phantom_examples_use_unambiguous_wrong_vs_real_labels() -> None:
 
 # --- Diff fallback prompt (build_diff_prompt + assemble_pr_diff) -------------
 
+from gemini_review.infrastructure.diff_parser import (  # noqa: E402
+    addable_lines_from_patch,
+)
 from gemini_review.infrastructure.gemini_prompt import (  # noqa: E402
     DIFF_MODE_NOTICE,
     assemble_pr_diff,
@@ -281,6 +284,10 @@ from gemini_review.infrastructure.gemini_prompt import (  # noqa: E402
 def _pr_with_patches(
     *file_patches: tuple[str, str],
 ) -> PullRequest:
+    """production 에서 `_fetch_files_for_pr` 가 같은 /files 응답으로 file_patches 와
+    addable_lines 를 동시 채우는 흐름을 정확히 모사 — assemble_pr_diff 가 캐시된
+    addable_lines 를 lookup 하므로 둘이 같은 source 에서 와야 함 (gemini PR #26 review #7).
+    """
     return PullRequest(
         repo=RepoRef("octo", "demo"),
         number=7,
@@ -295,6 +302,10 @@ def _pr_with_patches(
         installation_id=1,
         is_draft=False,
         file_patches=tuple(file_patches),
+        addable_lines=tuple(
+            (path, frozenset(addable_lines_from_patch(patch)))
+            for path, patch in file_patches
+        ),
     )
 
 
@@ -318,6 +329,55 @@ def test_assemble_pr_diff_returns_empty_string_when_no_patches() -> None:
     """file_patches 가 비었거나 모두 빈 patch 면 빈 문자열 — caller 가 fallback 포기 신호로 사용."""
     pr = _pr_with_patches()
     assert assemble_pr_diff(pr) == ""
+
+
+def test_assemble_pr_diff_uses_cached_addable_lines_not_reparsing_patches(
+    monkeypatch: object,
+) -> None:
+    """assemble_pr_diff / paths_in_pr_diff 가 캐시된 addable_lines 를 사용 — 정규식 재실행 X.
+
+    회귀 방지 (gemini PR #26 review #7): patch 정규식을 재실행하지 않고 PR fetch 시점에
+    이미 계산된 addable_lines 캐시를 lookup. 매번 호출마다 patch 파싱 비용이 발생하면
+    대형 PR (수십~수백 변경 파일) 에서 누적 비용이 무시할 수 없음.
+
+    monkeypatch 로 addable_lines_from_patch 를 가로채 호출 횟수 0 인지 확인.
+    """
+    import pytest as _pytest
+
+    from gemini_review.infrastructure import diff_parser
+    from gemini_review.infrastructure import gemini_prompt as gp
+
+    mp: _pytest.MonkeyPatch = monkeypatch  # type: ignore[assignment]
+
+    call_count = 0
+    original = diff_parser.addable_lines_from_patch
+
+    def counting(patch: str | None) -> set[int]:
+        nonlocal call_count
+        call_count += 1
+        return original(patch)
+
+    # gemini_prompt 가 직접 import 한 심볼이라 module 의 attribute 도 함께 패치
+    mp.setattr(diff_parser, "addable_lines_from_patch", counting)
+    if hasattr(gp, "addable_lines_from_patch"):
+        mp.setattr(gp, "addable_lines_from_patch", counting)
+
+    pr = _pr_with_patches(
+        ("a.py", "@@ -1,1 +1,2 @@\n a\n+B\n"),
+        ("b.py", "@@ -1,1 +1,2 @@\n c\n+D\n"),
+    )
+    # _pr_with_patches 가 helper 안에서 패치를 1회 파싱 (production 의 _fetch_files_for_pr
+    # 모사). 여기서 cache 가 채워진 시점부터 호출 카운트 리셋.
+    call_count = 0
+
+    assemble_pr_diff(pr)
+    paths_in_pr_diff_callable = gp.paths_in_pr_diff
+    paths_in_pr_diff_callable(pr)
+
+    assert call_count == 0, (
+        f"assemble_pr_diff / paths_in_pr_diff 는 캐시된 pr.addable_lines 를 lookup 해야 — "
+        f"addable_lines_from_patch 재실행 0 회 기대, 실제 {call_count} 회"
+    )
 
 
 def test_assemble_pr_diff_excludes_deleted_only_patches() -> None:

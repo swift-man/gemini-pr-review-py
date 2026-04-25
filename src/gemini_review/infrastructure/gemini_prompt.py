@@ -1,6 +1,6 @@
 from gemini_review.domain import FileDump, FileEntry, PullRequest
 
-from .diff_parser import addable_lines_from_patch, format_patch_with_line_numbers
+from .diff_parser import format_patch_with_line_numbers
 
 SYSTEM_RULES = """\
 당신은 숙련된 시니어 개발자이며 GitHub Pull Request의 **전체 코드베이스**를 한국어로 리뷰하는 봇입니다.
@@ -345,21 +345,28 @@ def assemble_pr_diff(pr: PullRequest) -> str:
 
     ### 삭제-only patch 제외 (codex PR #26 review #2)
 
-    `addable_lines_from_patch` 가 빈 set 을 돌려주는 patch (= RIGHT 라인이 하나도 없는
-    경우 — 전체 파일 삭제 등) 는 fallback 입력에서 제외한다. 모델이 review 해도
-    `(path, line)` 인라인 게시 불가하고, RIGHT 에 없는 내용을 phantom 단언할 risk 만
-    늘어남. PR description / 변경 파일 목록은 prompt 의 PR METADATA 섹션에 그대로
-    있어 "어떤 파일이 삭제됐다" 라는 큰 그림 정보는 보존됨.
+    addable RIGHT 라인이 0 인 patch (= 전체 파일 삭제 등) 는 fallback 입력에서 제외한다.
+    모델이 review 해도 `(path, line)` 인라인 게시 불가하고, RIGHT 에 없는 내용을 phantom
+    단언할 risk 만 늘어남. PR description / 변경 파일 목록은 prompt 의 PR METADATA 섹션
+    에 그대로 있어 "어떤 파일이 삭제됐다" 라는 큰 그림 정보는 보존됨.
 
     `paths_in_pr_diff(pr)` 와 같은 필터 규칙을 사용해 두 함수가 항상 같은 파일 집합을
     참조하도록 한다 (codex PR #26 review #4 — diff 입력 밖 파일에 대한 환각 finding 이
     valid_paths 통과되던 회귀 방지).
+
+    ### 캐시 활용 (gemini PR #26 review #7)
+
+    `pr.addable_lines` 는 PR fetch 시점에 같은 `_fetch_files_for_pr` 호출에서 같은
+    `addable_lines_from_patch(patch)` 로 계산돼 캐시된 값. 여기서 patch 정규식을 다시
+    돌리면 같은 결과를 두 번 계산하는 셈 — 캐시된 lookup 으로 대체해 PR 당 파싱 비용
+    절감 (대형 PR 에서 의미 있음).
     """
+    addable_by_path = pr.addable_lines_by_path()
     blocks: list[str] = []
     for path, patch in pr.file_patches:
         # 삭제-only patch 는 RIGHT 인라인 코멘트 불가 → diff fallback 에서 제외.
-        # `addable_lines_from_patch` 와 같은 카운터 규칙으로 판정 일관성 보장.
-        if not addable_lines_from_patch(patch):
+        # 캐시된 addable_lines 를 lookup — `addable_lines_from_patch` 재실행 회피.
+        if not addable_by_path.get(path):
             continue
         annotated = format_patch_with_line_numbers(patch)
         if not annotated:
@@ -376,9 +383,10 @@ def paths_in_pr_diff(pr: PullRequest) -> frozenset[str]:
     `assemble_pr_diff` 는 삭제-only / binary / truncate patch 를 입력에서 제외하므로,
     모델이 PR METADATA 만 보고 그 파일에 대한 환각 finding 을 만들면 파서에서 안 걸리고
     본문 surface 로 게시됨. 두 함수가 같은 필터 규칙을 따르도록 헬퍼로 분리.
+
+    `pr.addable_lines` 캐시 lookup 으로 patch 정규식 재실행 회피 (gemini PR #26 review #7).
     """
+    addable_by_path = pr.addable_lines_by_path()
     return frozenset(
-        path
-        for path, patch in pr.file_patches
-        if addable_lines_from_patch(patch)
+        path for path, _ in pr.file_patches if addable_by_path.get(path)
     )
