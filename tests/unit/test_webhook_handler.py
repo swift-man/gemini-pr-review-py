@@ -301,12 +301,14 @@ def test_use_case_falls_back_to_diff_review_when_budget_exceeded_with_patches(
         is_draft=False,
         file_patches=(("a.py", "@@ -1,1 +1,2 @@\n a\n+B\n"),),
     )
+    # 예산은 SYSTEM_RULES (~5KB) + DIFF_MODE_NOTICE + PR 메타 + diff 본문 합쳐 들어갈
+    # 만큼. 50000 tokens = 200000 chars 로 작은 diff 테스트는 여유롭게 통과.
     dump = FileDump(
         entries=(),
         total_chars=0,
         excluded=("a.py",),
         exceeded_budget=True,
-        budget=TokenBudget(1000),  # diff 1줄은 여유롭게 통과
+        budget=TokenBudget(50000),
     )
     expected = ReviewResult(summary="diff-review", event=ReviewEvent.COMMENT)
     engine = FakeEngine(expected)
@@ -317,7 +319,7 @@ def test_use_case_falls_back_to_diff_review_when_budget_exceeded_with_patches(
         engine=engine,
         finding_verifier=FakeFindingVerifier(),
         finding_deduper=FakeFindingDeduper(),
-        max_input_tokens=1000,
+        max_input_tokens=50000,
     )
 
     use_case.execute(pr)
@@ -329,6 +331,69 @@ def test_use_case_falls_back_to_diff_review_when_budget_exceeded_with_patches(
     assert github.posted_comments == [], "diff fallback 에선 notice 게시 안 함"
     assert len(github.posted_reviews) == 1
     assert github.posted_reviews[0][1] is expected, "diff review 결과가 그대로 게시돼야"
+
+
+def test_use_case_size_check_uses_full_prompt_not_just_diff_text(
+    tmp_path: Path,
+) -> None:
+    """예산 초과 검사는 build_diff_prompt 결과 전체 길이로 — diff_text 만 검사하면 회귀.
+
+    회귀 방지 (codex PR #26 review #1): 이전엔 `len(diff_text) > max_chars` 만 검사해
+    SYSTEM_RULES + DIFF_MODE_NOTICE + PR 메타 overhead 가 추가되면 실제 prompt 가
+    예산 초과해 모델이 거부하는 경계가 남았다. 이제는 build_diff_prompt(pr, diff_text)
+    결과 길이로 검사해 fallback 전 차단.
+
+    이 테스트는 raw diff_text 는 작지만 (수십 chars) 예산을 SYSTEM_RULES 보다 작게
+    잡아 prompt 전체로는 초과하는 경계 케이스. fallback 이 시도되면 안 되고 notice 가
+    게시돼야.
+    """
+    github = FakeGitHub()
+    pr = PullRequest(
+        repo=RepoRef("o", "r"),
+        number=42,
+        title="t",
+        body="",
+        head_sha="abc",
+        head_ref="feat",
+        base_sha="def",
+        base_ref="main",
+        clone_url="https://example/x.git",
+        changed_files=("a.py",),
+        installation_id=7,
+        is_draft=False,
+        # raw patch 는 소량 (~50 chars)
+        file_patches=(("a.py", "@@ -1,1 +1,1 @@\n-x\n+y\n"),),
+    )
+    # SYSTEM_RULES 만 ~5KB. token=500 (= 2000 chars) 면 SYSTEM_RULES 도 못 담음 →
+    # diff_text 본문 길이 (50 chars 미만) 만 검사하던 이전 로직은 이 케이스를 통과시켜
+    # engine 호출까지 갔던 회귀를 lock.
+    dump = FileDump(
+        entries=(),
+        total_chars=0,
+        excluded=("a.py",),
+        exceeded_budget=True,
+        budget=TokenBudget(500),
+    )
+    engine = FakeEngine(ReviewResult(summary="x", event=ReviewEvent.COMMENT))
+    use_case = ReviewPullRequestUseCase(
+        github=github,
+        repo_fetcher=FakeFetcher(tmp_path),
+        file_collector=FakeCollector(dump),
+        engine=engine,
+        finding_verifier=FakeFindingVerifier(),
+        finding_deduper=FakeFindingDeduper(),
+        max_input_tokens=500,
+    )
+
+    use_case.execute(pr)
+
+    assert engine.diff_calls == [], (
+        "diff 본문은 작아도 SYSTEM_RULES + DIFF_MODE_NOTICE + 메타 합치면 예산 초과 → "
+        "engine 호출 없이 notice"
+    )
+    assert github.posted_reviews == []
+    assert len(github.posted_comments) == 1
+    assert "예산 초과" in github.posted_comments[0][1]
 
 
 def test_use_case_posts_notice_when_diff_itself_too_large(

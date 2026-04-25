@@ -1,7 +1,7 @@
 import logging
 
 from gemini_review.domain import FileDump, PullRequest, ReviewResult, TokenBudget
-from gemini_review.infrastructure.gemini_prompt import assemble_pr_diff
+from gemini_review.infrastructure.gemini_prompt import assemble_pr_diff, build_diff_prompt
 from gemini_review.interfaces import (
     FileCollector,
     FindingDeduper,
@@ -12,10 +12,6 @@ from gemini_review.interfaces import (
 )
 
 logger = logging.getLogger(__name__)
-
-# 1 token ≈ 4 chars 보수 추정. diff 도 너무 커서 모델이 못 받으면 fallback notice 로 대체.
-# `dump.collect()` 에서 쓰는 동일 비율을 참조 — 별도 비율을 두면 두 곳이 어긋날 위험.
-_CHARS_PER_TOKEN = 4
 
 
 class ReviewPullRequestUseCase:
@@ -99,9 +95,18 @@ class ReviewPullRequestUseCase:
 
         - diff 가 비었거나 (`assemble_pr_diff` 가 모두 binary/truncate 라 None 반환):
           애초에 모델이 볼 게 없음 → 기존 notice.
-        - diff 가 있지만 char 추정 token 수가 max_input_tokens 초과: 모델이 거부할
-          가능성 큼 → notice (engine 호출은 비용·noise). 이 임계는 휴리스틱이라
-          미세 오차는 receive — 보수적이라 false-skip 쪽이 false-attempt 보다 안전.
+        - diff 는 있지만 **build_diff_prompt 로 합친 실제 입력 크기** (SYSTEM_RULES +
+          DIFF_MODE_NOTICE + PR 메타 + diff 본문) 가 char 예산 초과: 모델 호출이
+          어차피 실패할 가능성 큼 → notice (engine 호출 비용/noise 절감). diff_text
+          본문 길이만 검사하면 fixed prompt overhead 로 실제 입력이 한도를 넘는 경계
+          가 남음 (codex PR #26 review #1).
+
+        ### 예산 비교 정책의 단일 지점 — `TokenBudget.max_chars()`
+
+        char/token 변환 상수는 도메인의 `TokenBudget.chars_per_token()` 로 캡슐화돼
+        있어 use case 가 별도 상수를 두면 두 정책이 어긋날 위험. `self._budget` 인스턴스
+        의 `fits()` 를 직접 사용 — `FileDumpCollector` 와 동일 기준 (codex PR #26
+        review #1 권장 + gemini PR #26 권고).
         """
         diff_text = assemble_pr_diff(pr)
         if not diff_text:
@@ -113,24 +118,28 @@ class ReviewPullRequestUseCase:
             self._github.post_comment(pr, _budget_exceeded_message(pr, dump))
             return None
 
-        max_chars = self._budget.max_tokens * _CHARS_PER_TOKEN
-        if len(diff_text) > max_chars:
+        # 실제 모델 입력 = build_diff_prompt 결과. diff_text 만 검사하면 SYSTEM_RULES +
+        # DIFF_MODE_NOTICE + PR 메타 overhead 로 한도 초과 가능 (codex PR #26 review #1).
+        prompt_chars = len(build_diff_prompt(pr, diff_text))
+        if not self._budget.fits(prompt_chars):
             logger.warning(
-                "budget exceeded for %s#%d and diff also too large "
-                "(diff_chars=%d > max_chars=%d) — posting notice",
+                "budget exceeded for %s#%d and diff prompt also too large "
+                "(prompt_chars=%d > max_chars=%d, diff_chars=%d) — posting notice",
                 pr.repo.full_name,
                 pr.number,
+                prompt_chars,
+                self._budget.max_chars(),
                 len(diff_text),
-                max_chars,
             )
             self._github.post_comment(pr, _budget_exceeded_message(pr, dump))
             return None
 
         logger.warning(
             "budget exceeded for %s#%d — falling back to diff-only review "
-            "(diff_chars=%d, file_patches=%d)",
+            "(prompt_chars=%d, diff_chars=%d, file_patches=%d)",
             pr.repo.full_name,
             pr.number,
+            prompt_chars,
             len(diff_text),
             len(pr.file_patches),
         )
