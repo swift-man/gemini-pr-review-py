@@ -102,15 +102,22 @@ class DiffBasedResolutionChecker:
         if head is None or head.group(1) not in _BLOCKING_SEVERITIES:
             return
 
-        # 같은 SHA 에서 단 코멘트면 변경 가능성 0 (시간상 후속 push 가 없었음).
-        if comment.commit_id == pr.head_sha:
+        # **anchor SHA** 비교: original_commit_id 가 head_sha 와 같으면 코멘트 anchor
+        # 시점이 곧 현재 head 라는 뜻 — 시간상 후속 push 가 없었음. commit_id 로 비교
+        # 하면 GitHub 가 line shift 추적으로 commit_id 를 head 로 갱신해 둔 케이스에선
+        # 항상 같은 sha 로 보여 모든 reply 가 차단되는 회귀 (gemini PR #28 review #1).
+        if comment.original_commit_id == pr.head_sha:
             return
 
+        # **prior 측 = original anchor**: GitHub 가 추적해 갱신하기 전의 SHA / line.
+        # **current 측 = (commit_id, line)**: GitHub 가 head 시점으로 추적 갱신한 위치.
+        # GitHub 가 line shift 를 잘 따라갔다면 prior_content == head_content (라인이
+        # 옮겨졌을 뿐 본문 같음) → no reply. 진짜 본문이 바뀌었다면 다름 → reply.
         prior_line = _read_line_at_commit(
-            repo_root, comment.commit_id, comment.path, comment.line
+            repo_root, comment.original_commit_id, comment.path, comment.original_line
         )
         head_line = _read_line_at_commit(
-            repo_root, pr.head_sha, comment.path, comment.line
+            repo_root, comment.commit_id, comment.path, comment.line
         )
         if prior_line is None or head_line is None:
             # 한쪽이라도 못 읽으면 (commit unreachable, 파일 사라짐, 라인 범위 밖)
@@ -121,7 +128,7 @@ class DiffBasedResolutionChecker:
             return
 
         body = _build_resolution_reply(
-            prior_sha=comment.commit_id,
+            prior_sha=comment.original_commit_id,
             head_sha=pr.head_sha,
             prior_line=prior_line,
             head_line=head_line,
@@ -143,8 +150,8 @@ class DiffBasedResolutionChecker:
             pr.number,
             comment.comment_id,
             comment.path,
-            comment.line,
-            comment.commit_id[:7],
+            comment.original_line,
+            comment.original_commit_id[:7],
             pr.head_sha[:7],
         )
 

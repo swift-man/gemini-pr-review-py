@@ -658,6 +658,16 @@ def _map_review_comment(
     commit_id = entry.get("commit_id") or entry.get("original_commit_id")
     if not isinstance(comment_id, int) or not isinstance(commit_id, str):
         return None
+    # original_commit_id / original_line — Layer E 의 anchor 시점 비교용.
+    # GitHub 가 line shift 를 자동 추적해 commit_id/line 을 갱신하므로, 진짜 anchor 는
+    # original_* 에만 보존됨 (gemini PR #28 review #1). 응답에 없으면 commit_id/line 으로
+    # fallback — 모순 없는 안전 default (코멘트 갱신이 0 회였다면 둘이 같음).
+    raw_orig_sha = entry.get("original_commit_id")
+    original_commit_id = (
+        raw_orig_sha if isinstance(raw_orig_sha, str) and raw_orig_sha else commit_id
+    )
+    raw_orig_line = entry.get("original_line")
+    original_line = raw_orig_line if isinstance(raw_orig_line, int) else line
     # in_reply_to_id 는 옵션 — 본 봇 자신이 단 대댓글 식별용. 없으면 top-level.
     raw_reply_to = entry.get("in_reply_to_id")
     in_reply_to_id = raw_reply_to if isinstance(raw_reply_to, int) else None
@@ -668,6 +678,8 @@ def _map_review_comment(
         line=line,
         body=body,
         in_reply_to_id=in_reply_to_id,
+        original_commit_id=original_commit_id,
+        original_line=original_line,
     )
 
 

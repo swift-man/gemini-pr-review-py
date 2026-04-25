@@ -51,7 +51,12 @@ def _posted(
     line: int,
     body: str,
     in_reply_to_id: int | None = None,
+    original_commit_id: str | None = None,
+    original_line: int | None = None,
 ) -> PostedReviewComment:
+    """Layer E 테스트 helper. `original_*` 미지정 시 `commit_id`/`line` 으로 fallback —
+    line shift 가 없는 일반적 시나리오를 모사. shift 있는 케이스는 명시적으로 지정.
+    """
     return PostedReviewComment(
         comment_id=comment_id,
         commit_id=commit_id,
@@ -59,6 +64,8 @@ def _posted(
         line=line,
         body=body,
         in_reply_to_id=in_reply_to_id,
+        original_commit_id=original_commit_id if original_commit_id is not None else commit_id,
+        original_line=original_line if original_line is not None else line,
     )
 
 
@@ -140,16 +147,22 @@ def test_check_replies_when_blocking_comment_line_changed_between_pushes(
     회귀 방지: 사용자 요청 (2026-04) — "라인 코멘트를 일방적으로 다는 것에서 끝나지
     않고 후속 수정사항이 생기면 본인이 단 코멘트에 대댓글로 수정 여부 확인". 이 layer
     의 핵심 동작.
+
+    GitHub 의 코멘트 추적: 코멘트가 처음 만들어진 시점은 `original_commit_id` /
+    `original_line`. 후속 push 가 일어나면 GitHub 가 `commit_id`/`line` 을 head 시점
+    으로 갱신. Layer E 는 두 anchor (original vs current) 의 본문을 비교.
     """
     prior_sha = "oldshaaa"
     head_sha = "newshahead"
     existing = (
         _posted(
             comment_id=1001,
-            commit_id=prior_sha,
+            commit_id=head_sha,  # GitHub 가 head 로 추적 갱신
             path="a.py",
             line=10,
             body="[Major] 변수명 typo: usrname",
+            original_commit_id=prior_sha,  # 코멘트 anchor 시점
+            original_line=10,
         ),
     )
     _patch_git_show(monkeypatch, {
@@ -179,10 +192,12 @@ def test_check_replies_to_critical_comment_too(
     existing = (
         _posted(
             comment_id=1002,
-            commit_id="oldshaaa",
+            commit_id="newshahead",  # GitHub-tracked current
             path="b.py",
             line=5,
             body="[Critical] 보안: 직접 SQL 조립",
+            original_commit_id="oldshaaa",  # anchor 시점
+            original_line=5,
         ),
     )
     _patch_git_show(monkeypatch, {
@@ -197,6 +212,49 @@ def test_check_replies_to_critical_comment_too(
 
 
 # --- reply 안 함 (false positive 방지) -----------------------------------------
+
+
+def test_check_uses_original_anchor_so_line_shift_alone_does_not_trigger_reply(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """라인 shift (위쪽에 새 코드 추가) 만 일어나고 본문 같으면 reply 안 함.
+
+    GitHub 가 코멘트 line 을 +N 으로 추적 갱신해도 본문 동일이면 메인테이너 처리 신호 X.
+
+    회귀 방지 (gemini PR #28 review #1): 이전 구현은 `comment.commit_id` / `comment.line`
+    을 prior 측 anchor 로 사용. GitHub 가 line shift 추적으로 두 값을 head 시점으로
+    갱신하면 prior 측이 곧 head 측이 되어 항상 같은 본문 → 영원히 reply 안 함 (Layer E
+    무력화). 이제는 `original_commit_id` / `original_line` (anchor 보존됨) 을 prior 측
+    으로, `commit_id` / `line` (GitHub 추적 후 위치) 을 current 측으로 사용 → 라인이
+    옮겨졌을 뿐 본문 같음을 정확히 식별.
+    """
+    prior_sha = "oldshaaa"
+    head_sha = "newshahead"
+    existing = (
+        _posted(
+            comment_id=4001,
+            # GitHub 가 head 로 commit_id 갱신 + 위쪽에 새 라인 추가로 line 도 +5 갱신
+            commit_id=head_sha,
+            line=15,
+            path="a.py",
+            body="[Major] 잠재 버그",
+            # 코멘트 anchor 시점의 SHA / line 은 보존됨
+            original_commit_id=prior_sha,
+            original_line=10,
+        ),
+    )
+    # 같은 본문이 prior 시점엔 line 10 에, head 시점엔 (위쪽 코드 추가로) line 15 에 위치.
+    _patch_git_show(monkeypatch, {
+        (prior_sha, "a.py"): "\n" * 9 + "x = 1\n",   # line 10
+        (head_sha, "a.py"): "\n" * 14 + "x = 1\n",  # line 15 (같은 본문, 위치만 이동)
+    })
+
+    fake = _FakeGitHub(existing=existing)
+    DiffBasedResolutionChecker(fake).check_resolutions(_pr(head_sha=head_sha), tmp_path)
+
+    assert fake.replies == [], (
+        "라인이 옮겨졌을 뿐 본문은 같음 → 메인테이너 처리 신호 X → reply 안 함"
+    )
 
 
 def test_check_skips_when_line_unchanged(
@@ -358,10 +416,12 @@ def test_check_skips_replies_themselves_from_top_level_iteration(
         # 한 부모 코멘트
         _posted(
             comment_id=1010,
-            commit_id="oldshaaa",
+            commit_id="newshahead",  # GitHub-tracked current
             path="a.py",
             line=10,
             body="[Major] 부모",
+            original_commit_id="oldshaaa",
+            original_line=10,
         ),
         # 다른 부모 코멘트의 본 봇 reply (= top-level 아님). 이 reply 자체에 또 reply
         # 시도하면 안 됨. (in_reply_to_id 가 set 돼 있어 top-level 검사에서 제외돼야)
@@ -425,17 +485,21 @@ def test_check_graceful_degrade_on_per_reply_failure_continues(
     existing = (
         _posted(
             comment_id=2001,
-            commit_id="oldshaaa",
+            commit_id="newshahead",
             path="a.py",
             line=10,
             body="[Major] 첫 코멘트",
+            original_commit_id="oldshaaa",
+            original_line=10,
         ),
         _posted(
             comment_id=2002,
-            commit_id="oldshaaa",
+            commit_id="newshahead",
             path="b.py",
             line=20,
             body="[Major] 두번째 코멘트",
+            original_commit_id="oldshaaa",
+            original_line=20,
         ),
     )
     _patch_git_show(monkeypatch, {

@@ -47,15 +47,25 @@ class GitRepoFetcher:
                     ["git", "-C", str(repo_path), "remote", "set-url", "origin", authed_url]
                 )
 
-            # depth=1 로 PR 스냅샷만 얕게 받아 네트워크/디스크 비용을 최소화. 전체 히스토리가 필요
-            # 없는 리뷰 용도에 충분하다.
+            # PR ref 의 **전체 history** 를 fetch — `--depth 1` 은 의도적으로 빼 둠.
+            # `--filter=blob:none` partial clone 설정이 fetch 에도 자동 적용되므로 commit/
+            # tree 메타만 받고 blob 은 지연 로드 → 네트워크/디스크 비용은 거의 그대로지만
+            # PR 의 모든 commit 객체가 로컬에 존재하게 됨.
+            #
+            # 이전엔 `--depth 1` 로 head SHA 만 받았다. PR #28 (Layer E) 의 후속 수정 추적
+            # 이 본 봇 이전 코멘트의 `original_commit_id` (보통 head 가 아닌 과거 commit)
+            # 을 `git show {sha}:{path}` 로 읽어야 하는데, shallow 라 모든 prior commit
+            # 조회가 `fatal: bad object` 로 실패해 Layer E 가 실 환경에서 항상 graceful
+            # skip 만 됨 (gemini PR #28 review #2). 전체 PR history 는 일반적으로 작아서
+            # depth 제거 비용이 무시할 만하다.
+            #
             # `effective_fetch_ref()` 는 보통 `head_sha` 지만, fork 가 삭제된 PR 의 경우
             # `refs/pull/{n}/head` 를 반환해 base 저장소의 GitHub PR ref 로 PR 스냅샷을
             # 받을 수 있게 한다 (`fetch_pull_request` 의 `_resolve_fetch_source` 가 결정).
             # PR ref fetch 시엔 결과 SHA 가 `FETCH_HEAD` 에 들어가므로 checkout 도 그쪽으로.
             fetch_ref = pr.effective_fetch_ref()
             _run(
-                ["git", "-C", str(repo_path), "fetch", "--depth", "1", "origin", fetch_ref]
+                ["git", "-C", str(repo_path), "fetch", "origin", fetch_ref]
             )
             checkout_target = "FETCH_HEAD" if fetch_ref != pr.head_sha else pr.head_sha
             # --force: 이전 리뷰에서 남은 local modification 이 있어도 무시하고 대상 SHA 로 전환.
