@@ -64,10 +64,17 @@ class FakeGitHub:
     def list_self_review_comments(
         self, pr: PullRequest
     ) -> tuple[PostedReviewComment, ...]:
-        # 웹훅 흐름 테스트는 dedup 동작과 무관 — 항상 빈 history 반환.
-        # CrossPrFindingDeduper 의 진짜 동작은 별도 단위 테스트
-        # (`test_cross_pr_finding_deduper.py`) 에서 검증.
+        # 웹훅 흐름 테스트는 dedup/follow-up 동작과 무관 — 항상 빈 history 반환.
+        # CrossPrFindingDeduper / DiffBasedResolutionChecker 의 진짜 동작은 별도 단위
+        # 테스트에서 검증.
         return ()
+
+    def reply_to_review_comment(
+        self, pr: PullRequest, comment_id: int, body: str
+    ) -> None:
+        # 웹훅 흐름 테스트는 follow-up reply 동작과 무관 — no-op.
+        # DiffBasedResolutionChecker 의 진짜 동작은 별도 단위 테스트에서 검증.
+        return
 
     def get_installation_token(self, installation_id: int) -> str:
         return "fake-token"
@@ -127,6 +134,17 @@ class FakeFindingDeduper:
         return result
 
 
+class FakeFindingResolutionChecker:
+    """no-op — 웹훅 흐름 테스트는 follow-up reply 로직과 무관.
+
+    DiffBasedResolutionChecker 의 진짜 동작은 별도 단위 테스트
+    (`test_diff_based_resolution_checker.py`) 에서 검증.
+    """
+
+    def check_resolutions(self, pr: PullRequest, repo_root: Path) -> None:
+        return
+
+
 def _sign(body: bytes) -> str:
     return "sha256=" + hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
 
@@ -161,6 +179,7 @@ def _build_handler(
         engine=FakeEngine(result),
         finding_verifier=FakeFindingVerifier(),
         finding_deduper=FakeFindingDeduper(),
+        resolution_checker=FakeFindingResolutionChecker(),
         max_input_tokens=1000,
     )
     return WebhookHandler(secret=SECRET, github=github, use_case=use_case)
@@ -267,6 +286,7 @@ def test_use_case_posts_comment_when_budget_exceeded_and_no_diff_available(
         engine=FakeEngine(ReviewResult(summary="x", event=ReviewEvent.COMMENT)),
         finding_verifier=FakeFindingVerifier(),
         finding_deduper=FakeFindingDeduper(),
+        resolution_checker=FakeFindingResolutionChecker(),
         max_input_tokens=1,
     )
 
@@ -324,6 +344,7 @@ def test_use_case_falls_back_to_diff_review_when_budget_exceeded_with_patches(
         engine=engine,
         finding_verifier=FakeFindingVerifier(),
         finding_deduper=FakeFindingDeduper(),
+        resolution_checker=FakeFindingResolutionChecker(),
         max_input_tokens=50000,
     )
 
@@ -375,6 +396,7 @@ def test_use_case_does_not_fallback_when_changed_file_is_deleted_from_disk(
         engine=engine,
         finding_verifier=FakeFindingVerifier(),
         finding_deduper=FakeFindingDeduper(),
+        resolution_checker=FakeFindingResolutionChecker(),
         max_input_tokens=1000,
     )
 
@@ -423,6 +445,7 @@ def test_use_case_does_not_fallback_when_only_filter_cut_changed_files(
         engine=engine,
         finding_verifier=FakeFindingVerifier(),
         finding_deduper=FakeFindingDeduper(),
+        resolution_checker=FakeFindingResolutionChecker(),
         max_input_tokens=1000,
     )
 
@@ -485,6 +508,7 @@ def test_use_case_size_check_uses_full_prompt_not_just_diff_text(
         engine=engine,
         finding_verifier=FakeFindingVerifier(),
         finding_deduper=FakeFindingDeduper(),
+        resolution_checker=FakeFindingResolutionChecker(),
         max_input_tokens=500,
     )
 
@@ -542,6 +566,7 @@ def test_use_case_posts_notice_when_diff_itself_too_large(
         engine=engine,
         finding_verifier=FakeFindingVerifier(),
         finding_deduper=FakeFindingDeduper(),
+        resolution_checker=FakeFindingResolutionChecker(),
         max_input_tokens=100,
     )
 
@@ -571,6 +596,7 @@ def test_use_case_posts_review_when_budget_fits(tmp_path: Path) -> None:
         engine=FakeEngine(expected),
         finding_verifier=FakeFindingVerifier(),
         finding_deduper=FakeFindingDeduper(),
+        resolution_checker=FakeFindingResolutionChecker(),
         max_input_tokens=1000,
     )
 
@@ -581,12 +607,18 @@ def test_use_case_posts_review_when_budget_fits(tmp_path: Path) -> None:
     assert github.posted_reviews[0][1] is expected
 
 
-def test_use_case_chains_verify_then_dedupe_then_post(tmp_path: Path) -> None:
-    """오케스트레이션 순서 lock: engine → verifier → deduper → post_review.
+def test_use_case_chains_verify_then_dedupe_then_post_then_resolution_check(
+    tmp_path: Path,
+) -> None:
+    """오케스트레이션 순서 lock: engine → verifier → deduper → post_review → resolution_check.
 
-    회귀 방지: dedup 결과가 post_review 에 도달해야 한다 (Layer D 의 강등이 게시에 반영).
-    또한 deduper 가 verifier 출력을 받아야 — 순서가 뒤집히면 verifier 가 강등하기 전의
-    원본 등급이 dedup signature 형성에 쓰여 false positive 가 발생할 수 있다.
+    회귀 방지:
+    - dedup 결과가 post_review 에 도달해야 한다 (Layer D 강등 → 게시 반영).
+    - deduper 가 verifier 출력을 받아야 (순서 뒤집히면 강등 전 원본 등급이 dedup
+      signature 에 쓰여 false positive).
+    - resolution_check 는 post_review **이후** 호출 (Layer E — 게시 끝난 코멘트 history
+      를 바탕으로 follow-up. 게시 전에 호출되면 이번 push 의 새 코멘트도 포함돼 의미
+      없음).
     """
     github = FakeGitHub()
     pr = _sample_pr()
@@ -600,12 +632,15 @@ def test_use_case_chains_verify_then_dedupe_then_post(tmp_path: Path) -> None:
     verified_result = ReviewResult(summary="from-verifier", event=ReviewEvent.COMMENT)
     deduped_result = ReviewResult(summary="from-deduper", event=ReviewEvent.COMMENT)
 
+    call_order: list[str] = []
+
     class _OrderObservingVerifier:
         def __init__(self) -> None:
             self.received: ReviewResult | None = None
 
         def verify(self, result: ReviewResult, repo_root: Path) -> ReviewResult:
             self.received = result
+            call_order.append("verify")
             return verified_result
 
     class _OrderObservingDeduper:
@@ -614,10 +649,22 @@ def test_use_case_chains_verify_then_dedupe_then_post(tmp_path: Path) -> None:
 
         def dedupe(self, result: ReviewResult, pr: PullRequest) -> ReviewResult:
             self.received = result
+            call_order.append("dedupe")
             return deduped_result
+
+    class _OrderObservingResolutionChecker:
+        def check_resolutions(self, pr: PullRequest, repo_root: Path) -> None:
+            call_order.append("resolution_check")
+
+    class _OrderObservingGitHub(FakeGitHub):
+        def post_review(self, pr: PullRequest, result: ReviewResult) -> None:
+            call_order.append("post_review")
+            super().post_review(pr, result)
 
     verifier = _OrderObservingVerifier()
     deduper = _OrderObservingDeduper()
+    resolver = _OrderObservingResolutionChecker()
+    github = _OrderObservingGitHub()
     use_case = ReviewPullRequestUseCase(
         github=github,
         repo_fetcher=FakeFetcher(tmp_path),
@@ -625,6 +672,7 @@ def test_use_case_chains_verify_then_dedupe_then_post(tmp_path: Path) -> None:
         engine=FakeEngine(engine_result),
         finding_verifier=verifier,
         finding_deduper=deduper,
+        resolution_checker=resolver,
         max_input_tokens=1000,
     )
 
@@ -632,6 +680,9 @@ def test_use_case_chains_verify_then_dedupe_then_post(tmp_path: Path) -> None:
 
     assert verifier.received is engine_result, "verifier 는 engine 출력을 받아야"
     assert deduper.received is verified_result, "deduper 는 verifier 출력을 받아야 (순서 lock)"
+    assert call_order == ["verify", "dedupe", "post_review", "resolution_check"], (
+        f"순서가 어긋나면 안 됨. 실제: {call_order}"
+    )
     assert len(github.posted_reviews) == 1
     assert github.posted_reviews[0][1] is deduped_result, "게시되는 건 deduper 출력"
 
@@ -721,6 +772,7 @@ def _build_handler_with_engine(
         engine=engine,  # type: ignore[arg-type]
         finding_verifier=FakeFindingVerifier(),
         finding_deduper=FakeFindingDeduper(),
+        resolution_checker=FakeFindingResolutionChecker(),
         max_input_tokens=1000,
     )
     return WebhookHandler(secret=SECRET, github=gh, use_case=use_case)
@@ -899,6 +951,7 @@ def _build_handler_for_parallel_test(
         engine=engine,  # type: ignore[arg-type]
         finding_verifier=FakeFindingVerifier(),
         finding_deduper=FakeFindingDeduper(),
+        resolution_checker=FakeFindingResolutionChecker(),
         max_input_tokens=1000,
     )
     handler = WebhookHandler(

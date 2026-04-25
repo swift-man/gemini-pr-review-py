@@ -1259,21 +1259,29 @@ def test_list_self_review_comments_filters_by_app_id(
     """
     OUR_APP_ID = 1234
     OTHER_APP_ID = 9999
+    # id/commit_id 는 PR #28 (Layer E) 에서 PostedReviewComment 의 필수 필드로 추가됨
+    # — reply API + diff 비교에 사용. fake response 도 production 응답 구조와 일치시켜야.
     pages = [
         [
             {
+                "id": 1001,
+                "commit_id": "abc1234",
                 "path": "a.py",
                 "line": 10,
                 "body": "[Major] 본 봇이 게시.",
                 "performed_via_github_app": {"id": OUR_APP_ID, "name": "gemini-pr-review-bot"},
             },
             {
+                "id": 1002,
+                "commit_id": "abc1234",
                 "path": "a.py",
                 "line": 20,
                 "body": "[Critical] 다른 봇 (codex) 의 코멘트.",
                 "performed_via_github_app": {"id": OTHER_APP_ID, "name": "codex-review-bot"},
             },
             {
+                "id": 1003,
+                "commit_id": "abc1234",
                 "path": "a.py",
                 "line": 30,
                 "body": "사람이 단 코멘트.",
@@ -1305,6 +1313,8 @@ def test_list_self_review_comments_skips_outdated_with_null_line(
     pages = [
         [
             {
+                "id": 2001,
+                "commit_id": "abc1234",
                 "path": "a.py",
                 "line": None,  # outdated
                 "original_line": 10,  # GitHub 가 보존하지만 우리는 안 씀
@@ -1312,6 +1322,8 @@ def test_list_self_review_comments_skips_outdated_with_null_line(
                 "performed_via_github_app": {"id": OUR_APP_ID},
             },
             {
+                "id": 2002,
+                "commit_id": "abc1234",
                 "path": "a.py",
                 "line": 25,
                 "body": "[Major] 살아 있는 코멘트.",
@@ -1341,6 +1353,8 @@ def test_list_self_review_comments_paginates_until_short_page(
     OUR_APP_ID = 1234
     page1 = [
         {
+            "id": 3000 + i,
+            "commit_id": "abc1234",
             "path": "a.py",
             "line": i,
             "body": f"[Major] page1 #{i}.",
@@ -1350,6 +1364,8 @@ def test_list_self_review_comments_paginates_until_short_page(
     ]
     page2 = [
         {
+            "id": 4000 + i,
+            "commit_id": "abc1234",
             "path": "b.py",
             "line": i,
             "body": f"[Major] page2 #{i}.",
@@ -1408,3 +1424,67 @@ def test_list_self_review_comments_uses_newest_first_sort(
     assert "direction=desc" in url, (
         f"direction=desc 가 빠지면 최신 코멘트 우선 보장 깨짐. URL: {url}"
     )
+
+
+# --- reply_to_review_comment (Layer E follow-up) -----------------------------
+
+
+def test_reply_to_review_comment_posts_to_thread_replies_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """대댓글 게시 URL 이 `/pulls/{n}/comments/{cid}/replies` 형식이어야 한다.
+
+    회귀 방지: GitHub 의 reply API 경로는 일반 issue comment endpoint
+    (`/issues/{n}/comments`) 와 다름. 잘못된 endpoint 로 보내면 대댓글 thread 가
+    형성되지 않고 별도 코멘트로 게시됨.
+    """
+    captured: dict[str, Any] = {}
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        captured["url"] = req.full_url
+        captured["body"] = json.loads(req.data.decode("utf-8")) if req.data else None
+        return _FakeResponse(b'{"id": 9999}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-")
+    client.reply_to_review_comment(_sample_pr(), comment_id=1234, body="follow-up 본문")
+
+    assert captured["url"].endswith("/pulls/9/comments/1234/replies"), (
+        f"reply endpoint 가 thread replies 경로여야 함. 실제: {captured['url']}"
+    )
+    assert captured["body"] == {"body": "follow-up 본문"}
+
+
+def test_reply_to_review_comment_skips_post_in_dry_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DRY_RUN 모드에선 reply 호출이 게시 없이 로그만 남겨야 한다 (post_review/post_comment 와 동일 패턴)."""
+    posted: list[str] = []
+
+    def fake_urlopen(
+        req: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+        context: ssl.SSLContext | None = None,
+    ) -> _FakeResponse:
+        if "access_tokens" in req.full_url:
+            return _FakeResponse(b'{"token": "tkn", "expires_at": ""}')
+        posted.append(req.full_url)
+        return _FakeResponse(b'{}')
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(jwt, "encode", lambda *a, **k: "fake.jwt")
+
+    client = GitHubAppClient(app_id=1, private_key_pem="-", dry_run=True)
+    client.reply_to_review_comment(_sample_pr(), comment_id=1, body="x")
+
+    assert posted == [], "DRY_RUN 이면 어떤 게시도 일어나지 않아야"

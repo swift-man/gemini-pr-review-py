@@ -32,6 +32,21 @@ class GitHubClient(Protocol):
         """PR 에 단순 이슈 코멘트를 게시합니다. 예산 초과 안내 등에 사용합니다."""
         ...
 
+    def reply_to_review_comment(
+        self,
+        pr: PullRequest,
+        comment_id: int,
+        body: str,
+    ) -> None:
+        """기존 라인 고정 리뷰 코멘트에 대댓글을 게시합니다.
+
+        Layer E (`DiffBasedResolutionChecker`) 가 본 봇이 이전에 게시한 [Critical]/
+        [Major] finding 의 대상 라인이 새 push 에서 변경됐을 때 "수정 여부 확인" 대댓글을
+        다는 데 사용. GitHub 의 `POST /repos/{}/{}/pulls/{n}/comments/{cid}/replies`
+        엔드포인트.
+        """
+        ...
+
     def list_self_review_comments(
         self, pr: PullRequest
     ) -> tuple[PostedReviewComment, ...]:

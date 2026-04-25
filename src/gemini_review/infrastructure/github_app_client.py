@@ -406,6 +406,33 @@ class GitHubAppClient:
         url = f"{self._api_base}/repos/{pr.repo.full_name}/issues/{pr.number}/comments"
         self._request_object("POST", url, auth=f"token {token}", body={"body": body})
 
+    def reply_to_review_comment(
+        self,
+        pr: PullRequest,
+        comment_id: int,
+        body: str,
+    ) -> None:
+        """라인 고정 리뷰 코멘트에 대댓글 게시 (POST /pulls/{n}/comments/{cid}/replies).
+
+        Layer E 가 본 봇이 이전에 단 [Critical]/[Major] finding 의 대상 라인이 새 push
+        에서 수정됐을 때 부모 코멘트 thread 에 follow-up 대댓글을 다는 데 사용.
+        DRY_RUN 모드에선 게시 없이 로그만 — 운영 진단 시 흐름 검증용.
+        """
+        if self._dry_run:
+            logger.info(
+                "DRY_RUN — review comment reply not posted: %s#%d cid=%d",
+                pr.repo.full_name,
+                pr.number,
+                comment_id,
+            )
+            return
+        token = self.get_installation_token(pr.installation_id)
+        url = (
+            f"{self._api_base}/repos/{pr.repo.full_name}/pulls/{pr.number}"
+            f"/comments/{comment_id}/replies"
+        )
+        self._request_object("POST", url, auth=f"token {token}", body={"body": body})
+
     def list_self_review_comments(
         self, pr: PullRequest
     ) -> tuple[PostedReviewComment, ...]:
@@ -604,14 +631,14 @@ def _map_review_comment(
 ) -> PostedReviewComment | None:
     """GitHub `/pulls/{n}/comments` 응답 한 건을 도메인 객체로 매핑하거나 None 으로 드롭.
 
-    드롭 조건 (모두 dedup 시그니처로 부적합한 케이스):
+    드롭 조건 (모두 dedup/follow-up 시그니처로 부적합한 케이스):
       - 본 App 이 게시한 게 아님 (`performed_via_github_app.id != app_id`)
       - line anchor 가 깨졌음 (`line is None` — force-push 후 outdated)
-      - path/body 누락 — GitHub 응답 결손, dedup key 형성 불가
+      - path/body/id/commit 누락 — GitHub 응답 결손, key 형성 불가
 
     이 함수가 None 을 반환하는 모든 경로는 의도된 안전한 제외 — 호출자에 별도 신호
-    필요 없음. 잘못 매핑되어 false dedup 이 발동하는 것보다 dedup 이 동작하지 않는
-    편이 안전 (Layer D 는 방어 레이어).
+    필요 없음. 잘못 매핑되어 false dedup/false-reply 가 발동하는 것보다 동작하지 않는
+    편이 안전 (Layer D/E 모두 방어 레이어).
     """
     via = entry.get("performed_via_github_app")
     if not isinstance(via, dict):
@@ -625,7 +652,23 @@ def _map_review_comment(
     body = entry.get("body")
     if not isinstance(path, str) or not isinstance(body, str):
         return None
-    return PostedReviewComment(path=path, line=line, body=body)
+    # comment_id 와 commit_id 는 Layer E 의 reply API 호출 + 시점 SHA 비교에 필수.
+    # 둘 중 하나라도 비면 follow-up 자체가 불가능 → 매핑 드롭.
+    comment_id = entry.get("id")
+    commit_id = entry.get("commit_id") or entry.get("original_commit_id")
+    if not isinstance(comment_id, int) or not isinstance(commit_id, str):
+        return None
+    # in_reply_to_id 는 옵션 — 본 봇 자신이 단 대댓글 식별용. 없으면 top-level.
+    raw_reply_to = entry.get("in_reply_to_id")
+    in_reply_to_id = raw_reply_to if isinstance(raw_reply_to, int) else None
+    return PostedReviewComment(
+        comment_id=comment_id,
+        commit_id=commit_id,
+        path=path,
+        line=line,
+        body=body,
+        in_reply_to_id=in_reply_to_id,
+    )
 
 
 def _partition_findings(

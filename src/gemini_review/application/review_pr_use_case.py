@@ -5,6 +5,7 @@ from gemini_review.infrastructure.gemini_prompt import assemble_pr_diff, build_d
 from gemini_review.interfaces import (
     FileCollector,
     FindingDeduper,
+    FindingResolutionChecker,
     FindingVerifier,
     GitHubClient,
     RepoFetcher,
@@ -28,6 +29,7 @@ class ReviewPullRequestUseCase:
         engine: ReviewEngine,
         finding_verifier: FindingVerifier,
         finding_deduper: FindingDeduper,
+        resolution_checker: FindingResolutionChecker,
         max_input_tokens: int,
     ) -> None:
         self._github = github
@@ -36,6 +38,7 @@ class ReviewPullRequestUseCase:
         self._engine = engine
         self._finding_verifier = finding_verifier
         self._finding_deduper = finding_deduper
+        self._resolution_checker = resolution_checker
         self._budget = TokenBudget(max_tokens=max_input_tokens)
 
     def execute(self, pr: PullRequest) -> None:
@@ -77,6 +80,11 @@ class ReviewPullRequestUseCase:
         # 으로 강등. 4 회 연속 push 동일 phantom 코멘트 같은 alert fatigue 방어.
         result = self._finding_deduper.dedupe(result, pr)
         self._github.post_review(pr, result)
+        # Layer E — follow-up: 본 봇이 이전 push 에서 단 차단급 코멘트 중 라인이
+        # 새 push 에서 변경된 것에 대해 부모 thread 에 "수정 확인 요청" 대댓글을
+        # 게시. side effect 만 (반환 없음), 어떤 실패도 이미 끝난 post_review 에
+        # 영향 X (graceful degrade).
+        self._resolution_checker.check_resolutions(pr, repo_path)
 
 
     def _fallback_to_diff_review(
