@@ -350,6 +350,10 @@ def assemble_pr_diff(pr: PullRequest) -> str:
     `(path, line)` 인라인 게시 불가하고, RIGHT 에 없는 내용을 phantom 단언할 risk 만
     늘어남. PR description / 변경 파일 목록은 prompt 의 PR METADATA 섹션에 그대로
     있어 "어떤 파일이 삭제됐다" 라는 큰 그림 정보는 보존됨.
+
+    `paths_in_pr_diff(pr)` 와 같은 필터 규칙을 사용해 두 함수가 항상 같은 파일 집합을
+    참조하도록 한다 (codex PR #26 review #4 — diff 입력 밖 파일에 대한 환각 finding 이
+    valid_paths 통과되던 회귀 방지).
     """
     blocks: list[str] = []
     for path, patch in pr.file_patches:
@@ -362,3 +366,19 @@ def assemble_pr_diff(pr: PullRequest) -> str:
             continue
         blocks.append(f"--- FILE: {path} ---\n{annotated}\n--- END FILE ---")
     return "\n\n".join(blocks)
+
+
+def paths_in_pr_diff(pr: PullRequest) -> frozenset[str]:
+    """`assemble_pr_diff` 에 실제 포함되는 파일 경로 집합 — diff 모드 valid_paths.
+
+    회귀 방지 (codex PR #26 review #4): diff fallback 에서 `parse_review(valid_paths=
+    pr.changed_files)` 로 valid 를 정하면 PR 전체 변경 파일이 인정됨. 그런데
+    `assemble_pr_diff` 는 삭제-only / binary / truncate patch 를 입력에서 제외하므로,
+    모델이 PR METADATA 만 보고 그 파일에 대한 환각 finding 을 만들면 파서에서 안 걸리고
+    본문 surface 로 게시됨. 두 함수가 같은 필터 규칙을 따르도록 헬퍼로 분리.
+    """
+    return frozenset(
+        path
+        for path, patch in pr.file_patches
+        if addable_lines_from_patch(patch)
+    )

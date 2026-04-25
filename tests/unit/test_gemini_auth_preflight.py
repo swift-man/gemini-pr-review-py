@@ -545,8 +545,76 @@ def test_review_diff_invokes_with_diff_prompt_and_returns_parsed_result(
         "diff prompt 의 DIFF MODE notice 가 stdin 에 들어가야"
     )
     assert diff_text in str(captured["input"])
-    assert result.summary == "diff review 완료"
+    # summary 에 diff-only 모드 안내가 prepend 되고 모델 응답 본문이 뒤따른다
+    # (codex/gemini PR #26 review #4: 사용자 가시성 — 본문 상단에서 narrower 리뷰 인지)
+    assert result.summary.startswith("⚠️ "), "diff-only 모드 안내가 summary 앞에 와야"
+    assert "diff-only fallback 모드" in result.summary
+    assert "diff review 완료" in result.summary, "원래 모델 응답 본문도 뒤따라야"
     assert result.model == "gemini-2.5-pro"
+
+
+def test_review_diff_drops_findings_on_files_excluded_from_diff_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """diff 모드 valid_paths 가 paths_in_pr_diff(pr) — diff 입력 밖 파일 finding 은 드롭.
+
+    회귀 방지 (codex PR #26 review #4): 이전엔 review_diff 도 valid_paths 를
+    `frozenset(pr.changed_files)` 로 설정해, `assemble_pr_diff` 가 입력에서 제외한
+    삭제-only / binary / truncate patch 의 파일에 대해 모델이 PR METADATA 만 보고
+    환각 finding 을 만들면 파서에서 안 걸리고 본문 surface 로 게시됐다.
+
+    이제는 review_diff 가 diff 에 실제 포함된 파일 (`paths_in_pr_diff`) 만 valid 로
+    인정 → 삭제 파일 finding 은 파서에서 드롭.
+    """
+
+    def fake_run(cmd: list[str], **_kwargs: Any) -> _FakeCompleted:
+        # 모델이 두 파일에 finding 을 만든다고 가정:
+        #   - kept.py: diff 에 실제 포함됨 → 통과해야
+        #   - deleted.py: 삭제-only patch 라 diff 에서 제외됨 → 환각으로 드롭돼야
+        return _FakeCompleted(
+            0,
+            json.dumps({
+                "summary": "two findings",
+                "event": "COMMENT",
+                "comments": [
+                    {"path": "kept.py", "line": 1, "body": "[Major] 정상 finding"},
+                    {"path": "deleted.py", "line": 1, "body": "[Critical] 환각"},
+                ],
+            }),
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    pr = PullRequest(
+        repo=RepoRef("o", "r"),
+        number=42,
+        title="t",
+        body="",
+        head_sha="abc",
+        head_ref="feat",
+        base_sha="def",
+        base_ref="main",
+        clone_url="https://x.git",
+        # changed_files 에 두 파일 다 들어감 (PR 메타 그대로)
+        changed_files=("kept.py", "deleted.py"),
+        installation_id=7,
+        is_draft=False,
+        # file_patches: kept.py 만 RIGHT 라인 있는 patch. deleted.py 는 삭제-only
+        # → assemble_pr_diff / paths_in_pr_diff 에서 제외됨.
+        file_patches=(
+            ("kept.py", "@@ -1,1 +1,2 @@\n a\n+B\n"),
+            ("deleted.py", "@@ -1,3 +0,0 @@\n-old1\n-old2\n-old3\n"),
+        ),
+    )
+    result = GeminiCliEngine(binary="gemini", model="gemini-2.5-pro").review_diff(
+        pr, "stub diff"
+    )
+
+    paths = [f.path for f in result.findings]
+    assert "kept.py" in paths, "diff 입력에 포함된 파일의 finding 은 통과"
+    assert "deleted.py" not in paths, (
+        "diff 입력 밖 (삭제-only) 파일의 환각 finding 은 valid_paths 에서 드롭"
+    )
 
 
 def test_review_diff_falls_back_through_models_on_capacity_failure(
@@ -598,4 +666,6 @@ def test_review_diff_falls_back_through_models_on_capacity_failure(
         "review_diff 도 fallback chain 을 그대로 따라야"
     )
     assert result.model == "gemini-2.5-pro"
-    assert result.summary == "fallback ok"
+    # diff-only 모드 안내 prepend 후 본문 뒤따름
+    assert "fallback ok" in result.summary
+    assert result.summary.startswith("⚠️ ")
