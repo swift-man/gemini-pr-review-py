@@ -66,7 +66,7 @@ def test_checkout_uses_head_sha_when_fetch_ref_empty(
 
     fetcher.checkout(_make_pr(fetch_ref=""), installation_token="tkn")
 
-    fetch_cmds = [c for c in calls if "fetch" in c and "--depth" in c]
+    fetch_cmds = [c for c in calls if "fetch" in c and "origin" in c]
     checkout_cmds = [c for c in calls if "checkout" in c and "--force" in c]
     assert len(fetch_cmds) == 1 and fetch_cmds[0][-1] == "abc123", (
         "fetch_ref 비어있으면 head_sha 로 fetch 해야"
@@ -92,7 +92,7 @@ def test_checkout_uses_pr_ref_when_fetch_ref_set_to_pull_ref(
     pr = _make_pr(fetch_ref="refs/pull/42/head", clone_url="https://base/x.git")
     fetcher.checkout(pr, installation_token="tkn")
 
-    fetch_cmds = [c for c in calls if "fetch" in c and "--depth" in c]
+    fetch_cmds = [c for c in calls if "fetch" in c and "origin" in c]
     checkout_cmds = [c for c in calls if "checkout" in c and "--force" in c]
     assert len(fetch_cmds) == 1
     # fetch ref 는 PR ref
@@ -145,7 +145,7 @@ def test_checkout_restores_origin_url_even_when_fetch_fails(
     def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         calls.append(cmd)
         # fetch 호출에서 실패 — 토큰이 이미 set-url 로 주입된 상태에서
-        if "fetch" in cmd and "--depth" in cmd:
+        if "fetch" in cmd and "origin" in cmd:
             return subprocess.CompletedProcess(cmd, returncode=128, stdout="", stderr="boom")
         return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
 

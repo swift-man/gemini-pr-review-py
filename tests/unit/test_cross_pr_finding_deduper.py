@@ -45,6 +45,27 @@ def _result(*findings: Finding, event: ReviewEvent = ReviewEvent.REQUEST_CHANGES
     return ReviewResult(summary="x", event=event, findings=findings)
 
 
+# Layer D 의 dedup 시그니처는 (path, line, severity-stripped body) 만 본다.
+# `comment_id` / `commit_id` 는 Layer E (resolution checker) 가 사용하는 필드라
+# Layer D 단위 테스트에선 placeholder 면 충분 — 매 케이스마다 dummy 값을 반복하지
+# 않도록 helper 로 캡슐화.
+def _posted(
+    path: str,
+    line: int,
+    body: str,
+    *,
+    comment_id: int = 100,
+    commit_id: str = "deadbeef",
+) -> PostedReviewComment:
+    return PostedReviewComment(
+        comment_id=comment_id,
+        commit_id=commit_id,
+        path=path,
+        line=line,
+        body=body,
+    )
+
+
 class _FakeGitHub:
     """GitHubClient 프로토콜의 dedup 관련 메서드만 fake. 다른 메서드는 호출되지 않아야."""
 
@@ -86,7 +107,7 @@ def test_dedupe_demotes_when_same_path_line_body_already_posted() -> None:
     회귀 방지: 4 회 연속 push 동일 phantom 코멘트 시나리오. 2 회차부터 강등.
     """
     existing = (
-        PostedReviewComment(
+        _posted(
             path="README.md",
             line=120,
             body="[Major] 패키지명 앞에 공백(`\" @scope\"`)이 있습니다.",
@@ -108,7 +129,7 @@ def test_dedupe_demotes_when_same_path_line_body_already_posted() -> None:
 def test_dedupe_demotes_critical_against_previously_posted_critical() -> None:
     """[Critical] 도 dedup 발동 — phantom Critical 이 반복되는 alert fatigue 차단."""
     existing = (
-        PostedReviewComment(
+        _posted(
             path=".github/workflows/ci.yml",
             line=29,
             body="[Critical] CI 즉시 실패 단언 (잘못된 grounding).",
@@ -133,7 +154,7 @@ def test_dedupe_matches_after_severity_prefix_strip() -> None:
     severity prefix 떼고 strip 한 본문 — 등급은 시그니처에 포함 안 됨.
     """
     existing = (
-        PostedReviewComment(
+        _posted(
             path="a.py",
             line=10,
             body="[Critical] 동일 본문 — 등급만 변경.",
@@ -153,7 +174,7 @@ def test_dedupe_matches_after_severity_prefix_strip() -> None:
 def test_dedupe_event_renormalized_after_demotion() -> None:
     """블로킹 finding 이 모두 dedup 강등되면 REQUEST_CHANGES → COMMENT 로 재정합."""
     existing = (
-        PostedReviewComment(
+        _posted(
             path="a.py",
             line=10,
             body="[Major] 같은 지적 반복.",
@@ -178,7 +199,7 @@ def test_dedupe_keeps_when_different_line() -> None:
     유형의 미처리 케이스).
     """
     existing = (
-        PostedReviewComment(path="a.py", line=10, body="[Major] 같은 패턴 다른 위치."),
+        _posted(path="a.py", line=10, body="[Major] 같은 패턴 다른 위치."),
     )
     new_finding = Finding(path="a.py", line=20, body="[Major] 같은 패턴 다른 위치.")
 
@@ -190,7 +211,7 @@ def test_dedupe_keeps_when_different_line() -> None:
 def test_dedupe_keeps_when_different_body() -> None:
     """같은 path/line 이라도 본문이 다르면 강등 안 함 — 정당 finding 보존."""
     existing = (
-        PostedReviewComment(path="a.py", line=10, body="[Major] 첫 push 의 지적."),
+        _posted(path="a.py", line=10, body="[Major] 첫 push 의 지적."),
     )
     new_finding = Finding(path="a.py", line=10, body="[Major] 다른 내용의 새 지적.")
 
@@ -202,7 +223,7 @@ def test_dedupe_keeps_when_different_body() -> None:
 def test_dedupe_keeps_when_different_path() -> None:
     """같은 line/body 이라도 다른 파일이면 강등 안 함."""
     existing = (
-        PostedReviewComment(path="a.py", line=10, body="[Major] 같은 본문 다른 파일."),
+        _posted(path="a.py", line=10, body="[Major] 같은 본문 다른 파일."),
     )
     new_finding = Finding(path="b.py", line=10, body="[Major] 같은 본문 다른 파일.")
 
@@ -219,8 +240,8 @@ def test_dedupe_skips_minor_and_suggestion() -> None:
     적합 — 권고 finding 은 무시되는 게 정상이라서.
     """
     existing = (
-        PostedReviewComment(path="a.py", line=10, body="[Minor] 권고."),
-        PostedReviewComment(path="a.py", line=20, body="[Suggestion] 제안."),
+        _posted(path="a.py", line=10, body="[Minor] 권고."),
+        _posted(path="a.py", line=20, body="[Suggestion] 제안."),
     )
     new_findings = (
         Finding(path="a.py", line=10, body="[Minor] 권고."),
@@ -310,7 +331,7 @@ def test_dedupe_matches_against_previously_auto_demoted_history_layer_d() -> Non
     """
     existing = (
         # 2 회차 dedup 결과 게시된 본문 — 자동 강등 prefix 포함
-        PostedReviewComment(
+        _posted(
             path="README.md",
             line=120,
             body=(
@@ -342,7 +363,7 @@ def test_dedupe_matches_against_previously_layer_b_demoted_history() -> None:
     강등 prefix 가 모두 정규화에서 떨어져야 함.
     """
     existing = (
-        PostedReviewComment(
+        _posted(
             path="README.md",
             line=120,
             body=(
@@ -366,7 +387,7 @@ def test_dedupe_matches_against_previously_layer_b_demoted_history() -> None:
 def test_dedupe_matches_when_only_whitespace_padding_differs() -> None:
     """양끝 공백/줄바꿈은 strip 으로 정규화 — 사소한 형식 차이로 dedup 우회 못 하도록."""
     existing = (
-        PostedReviewComment(
+        _posted(
             path="a.py", line=10, body="[Major]   동일 본문 (앞뒤 공백 차이).  "
         ),
     )
@@ -387,7 +408,7 @@ def test_dedupe_keeps_when_internal_word_differs() -> None:
     그 비용은 phantom finding 첫 게시와 거의 같음.
     """
     existing = (
-        PostedReviewComment(path="a.py", line=10, body="[Major] 변수명 typo: usrname"),
+        _posted(path="a.py", line=10, body="[Major] 변수명 typo: usrname"),
     )
     new_finding = Finding(path="a.py", line=10, body="[Major] 변수명 typo: usename")  # 한 글자 다름
 
